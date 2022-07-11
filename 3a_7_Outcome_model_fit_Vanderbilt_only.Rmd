@@ -1,0 +1,334 @@
+---
+author: "Leon Di Stefano"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    keep_md: false
+params:
+  fit_name: "main_fit_Vanderbilt_only"
+  outcome_min: 28
+  outcome_max: 35
+title: "`r paste0('Outcome model fit', params$outcome_min, params$outcome_max, params$fit_name, sep = '-')`"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+require(here)
+require(brms)
+require(tidybayes)
+require(mice)
+require(cmdstanr)
+
+here::i_am(file.path("hcq_pooling_analysis", "3a_7_Outcome_model_fit_Vanderbilt_only.Rmd"))
+
+source(here("hcq_pooling_analysis", "common.R"))
+
+set_cmdstan_path(here::here("hcq_pooling_analysis", ".cmdstan", "cmdstan-2.27.0"))
+
+out_stub         <- paste(params$outcome_min, params$outcome_max, sep = '-')
+output_dir       <- here("hcq_pooling_analysis", "output", out_stub)
+output_model_dir <- file.path(output_dir, params$fit_name)
+if(!dir.exists(output_model_dir)) {
+  dir.create(output_model_dir, recursive = TRUE)
+}
+```
+
+```{r}
+params
+```
+
+Read multiply-imputed data:
+
+```{r}
+mice_df_list_all <-
+  read_rds(here(output_dir, "mice_complete_df_list.rds"))
+
+mice_df_list_orchid_only <-
+  mice_df_list_all %>%
+  # FIT ONLY TO ORCHID DATA
+  map(function(d) { filter(d, siteid == "ORCHID") })
+
+# patients <-
+#   read_rds(here(output_dir, "patients.rds"))
+
+map(mice_df_list_orchid_only, nrow)
+```
+
+Specify the primary model formula:
+
+```{r}
+orchid_only_model <-
+  brms::bf(
+    niaid_outcome ~
+        treat*(
+          sex_model +
+          splines::ns(age_model, 3) +
+          splines::ns(bmi_model, 3) +
+          splines::ns(comorbidity_count, 3) +
+          niaid_baseline_numeric_model
+        ) +
+        # (1 + treat || siteid) + ## Exclude site random effects
+        (1 + treat || niaid_baseline_fct)
+  )
+```
+
+The problem we have is that there are no individuals with outcome NCOSS of 3 in the ORCHID data.
+
+This means that the stan code output by `brm`, as well as the stan data prepared by `brm`, have only 6 levels/5 cutpoints instead of 7 levels/6 cutpoints.
+
+The solution, it would seem, is to 
+
+1.  manually produce stan code as for the full model, then 
+2.  apply this to manually filtered ORCHID-only stan data.
+
+Manually producing the stan code:
+
+```{r}
+(orchid_model_stancode <- 
+  make_stancode(
+    formula = orchid_only_model, 
+    family = cumulative,
+    data = mice_df_list_all[[1]],
+    prior = prior(student_t(3, 0, 10), class = sd)))
+```
+
+Manually producing stan data:
+
+```{r}
+orchid_model_standata_imp1 <-
+ make_standata(
+    formula = orchid_only_model, 
+    family = cumulative,
+    data = mice_df_list_all[[1]],
+    prior = prior(student_t(3, 0, 10), class = sd))
+```
+
+Note that there are 6 thresholds (correct):
+
+```{r}
+orchid_model_standata_imp1$nthres
+```
+
+... and the responses go from 1 to 7:
+
+```{r}
+orchid_model_standata_imp1$Y %>% table()
+```
+
+Whereas if I do the same for the ORCHID data only:
+
+```{r}
+orchid_model_standata_imp1_orchid_only <-
+ make_standata(
+    formula = orchid_only_model, 
+    family = cumulative,
+    data = mice_df_list_orchid_only[[1]],
+    prior = prior(student_t(3, 0, 10), class = sd))
+```
+
+```{r}
+orchid_model_standata_imp1_orchid_only$nthres
+```
+
+... and the responses go from 1 to 6!:
+
+```{r}
+orchid_model_standata_imp1_orchid_only$Y %>% table()
+```
+
+Cf. the raw data coding:
+
+```{r}
+mice_df_list_orchid_only[[1]]$niaid_outcome %>% as.numeric() %>% table()
+```
+
+Filtering the "all data" standata object manually:
+
+```{r}
+names(orchid_model_standata_imp1)
+```
+
+```{r}
+orchid_indices_among_nonmissing_y <- 
+  (mice_df_list_all[[1]] %>% filter(!is.na(niaid_outcome)))$siteid == "ORCHID" 
+
+c(n_nonmissing = length(orchid_indices_among_nonmissing_y),
+  n_nonmissing_orchid = sum(orchid_indices_among_nonmissing_y))
+```
+
+```{r}
+map(orchid_model_standata_imp1, dim)
+map(orchid_model_standata_imp1, length)
+```
+
+```{r}
+orchid_model_standata_imp1_orchid_only_manual <- orchid_model_standata_imp1
+
+orchid_model_standata_imp1_orchid_only_manual$N <- 
+  sum(orchid_indices_among_nonmissing_y)
+
+orchid_model_standata_imp1_orchid_only_manual$Y <- 
+  orchid_model_standata_imp1$Y[orchid_indices_among_nonmissing_y]
+
+orchid_model_standata_imp1_orchid_only_manual$X <- 
+  orchid_model_standata_imp1$X[orchid_indices_among_nonmissing_y,]
+
+orchid_model_standata_imp1_orchid_only_manual$Z_1_1 <- 
+  orchid_model_standata_imp1$Z_1_1[orchid_indices_among_nonmissing_y]
+
+orchid_model_standata_imp1_orchid_only_manual$Z_1_2 <- 
+  orchid_model_standata_imp1$Z_1_2[orchid_indices_among_nonmissing_y]
+
+orchid_model_standata_imp1_orchid_only_manual$J_1 <- 
+  orchid_model_standata_imp1$J_1[orchid_indices_among_nonmissing_y]
+
+attr(orchid_model_standata_imp1_orchid_only_manual, "class") <- "standata"
+```
+
+```{r}
+map(orchid_model_standata_imp1_orchid_only_manual, dim)
+map(orchid_model_standata_imp1_orchid_only_manual, length)
+```
+
+Try to fit with this:
+
+```{r}
+system.time(
+  imp_1_orchid_only_fit <- rstan::stan(model_code = orchid_model_stancode, data = orchid_model_standata_imp1_orchid_only_manual))
+```
+
+Check that there are 6 cutpoints:
+
+```{r}
+bayesplot::mcmc_dens(imp_1_orchid_only_fit, regex_pars = "b_Intercept")
+```
+
+Try turning this into a `brmsfit` object:
+
+```{r}
+orchid_only_test_brmfit_1 <- brm(
+    formula = orchid_only_model, 
+    family = cumulative,
+    data = mice_df_list_all[[1]],
+    prior = prior(student_t(3, 0, 10), class = sd),
+    empty = TRUE)
+
+orchid_only_test_brmfit_1$fit <- imp_1_orchid_only_fit
+orchid_only_test_brmfit_1 <- rename_pars(orchid_only_test_brmfit_1)
+orchid_only_test_brmfit_1
+```
+
+Create a function for updating the "standata" to only include ORCHID:
+
+```{r}
+filter_standata_to_orchid <- function(old_standata, orchid_indices) {
+  new_standata <- old_standata
+
+  new_standata$N <- 
+    sum(orchid_indices)
+  
+  new_standata$Y <- 
+    old_standata$Y[orchid_indices]
+  
+  new_standata$X <- 
+    old_standata$X[orchid_indices,]
+  
+  new_standata$Z_1_1 <- 
+    old_standata$Z_1_1[orchid_indices]
+  
+  new_standata$Z_1_2 <- 
+    old_standata$Z_1_2[orchid_indices]
+  
+  new_standata$J_1 <- 
+    old_standata$J_1[orchid_indices]
+  
+  attr(new_standata, "class") <- "standata"
+
+  return(new_standata)
+  }
+```
+
+Create "standata" objects for each of the imputations:
+
+```{r}
+mice_standata_list_orchid <- 
+  map(mice_df_list_all, function (d) {
+    make_standata(
+      formula = orchid_only_model, 
+      family = cumulative,
+      data = d,
+      prior = prior(student_t(3, 0, 10), class = sd)) %>%
+    filter_standata_to_orchid(orchid_indices_among_nonmissing_y)
+  })
+```
+
+Model fitting function:
+
+```{r}
+ncores <- parallel::detectCores() - 1
+
+fit_orchid_standata <- function(orchid_standata) {
+  rstan::stan(
+    model_code = orchid_model_stancode, 
+    data = orchid_standata,
+    cores = ncores,
+    iter = 3000,
+    thin = 3,
+    control = list(adapt_delta = 0.999),
+    seed = 20200524)
+}
+```
+
+Fit each of these models:
+
+```{r}
+stan_fit_list_orchid <-
+  map(mice_standata_list_orchid, fit_orchid_standata)
+```
+
+Create `brmfit` objects:
+
+```{r}
+brmfit_list <-
+  map2(stan_fit_list_orchid, mice_df_list_all,
+  function(stanfit, full_df) {
+    brm_fit <- brm(
+      formula = orchid_only_model, 
+      family = cumulative,
+      data = mice_df_list_all[[1]],
+      prior = prior(student_t(3, 0, 10), class = sd),
+      empty = TRUE)
+
+    brm_fit$fit <- stanfit
+    brm_fit <- rename_pars(brm_fit)
+    return(brm_fit)
+  }
+  )
+```
+
+Now combine these:
+
+```{r}
+brmfit_combined <- combine_models(mlist = brmfit_list, check_data = FALSE)
+
+# The source for brm_multiple does this, and we make use of it
+brmfit_combined$rhats <- do.call(rbind, map(brmfit_list, rhat))
+```
+
+Fit the primary outcome model:
+
+```{r message=FALSE}
+write_rds(brmfit_combined, file.path(output_model_dir, paste0(params$fit_name, ".rds")))
+```
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+```{r}
+Sys.time()
+```
+

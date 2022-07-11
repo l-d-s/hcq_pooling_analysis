@@ -1,0 +1,87 @@
+---
+author: Leon Di Stefano
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    keep_md: false
+title: "Comparing models"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+require(here)
+require(brms)
+require(tidybayes)
+require(mice)
+here::i_am(file.path("hcq_pooling_analysis", "8_Comparing_model_fits.Rmd"))
+source(here("hcq_pooling_analysis", "common.R"))
+
+output_dir <- here("hcq_pooling_analysis", "output", "comparing_models")
+```
+
+We also want bayesplot for loo-specific diagnostics:
+
+```{r}
+require(bayesplot)
+```
+
+```{r}
+main_fit <- read_rds("output/28-35/main_fit/main_fit.rds")
+main_fit_loo <- read_rds("output/28-35/main_fit/loo_fit_main_fit.rds")
+
+priors_fit <- read_rds("output/28-35/main_fit_with_priors/main_fit_with_priors.rds")
+priors_fit_loo <- read_rds("output/28-35/main_fit_with_priors/loo_fit_main_fit_with_priors.rds")
+
+no_interactions <- read_rds("output/28-35/main_fit_no_interactions/main_fit_no_interactions.rds")
+no_interactions_loo <- read_rds("output/28-35/main_fit_no_interactions/loo_fit_main_fit_no_interactions.rds")
+
+sap_extras <- read_rds("output/28-35/main_fit_sap_extras/main_fit_sap_extras.rds")
+sap_extras_loo <- read_rds("output/28-35/main_fit_sap_extras/loo_fit_main_fit_sap_extras.rds")
+
+orchid_only <- read_rds("output/28-35/main_fit_Vanderbilt_only/main_fit_Vanderbilt_only.rds")
+orchid_only_loo <- read_rds("output/28-35/main_fit_Vanderbilt_only/loo_fit_main_fit_Vanderbilt_only.rds")
+```
+
+Compare estimated ELPDs (a utility—higher is better)
+
+```{r}
+loo_compare(
+  list(
+    main_fit = main_fit_loo, 
+    priors_fit = priors_fit_loo, 
+    no_interaction_fit = no_interactions_loo,
+    sap_extras_fit = sap_extras_loo,
+    orchid_only = orchid_only_loo)) %>%
+  knitr::kable()
+```
+
+
+```{r}
+loo_compare(
+  list(
+    main_fit = main_fit_loo, 
+    priors_fit = priors_fit_loo, 
+    no_interaction_fit = no_interactions_loo,
+    sap_extras_fit = sap_extras_loo,
+    orchid_only_fit = orchid_only_loo)) %>%
+  round(1) %>%
+  knitr::kable()
+```
+Some guidance on the interpretation of these:
+
+-   https://discourse.mc-stan.org/t/a-quick-note-what-i-infer-from-p-loo-and-pareto-k-values/3446
+-   https://avehtari.github.io/modelselection/CV-FAQ.html#2_What_are_all_the_acronyms_and_parts_of_cross-validation
+-   https://mc-stan.org/loo/reference/loo-glossary.html
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+```{r}
+Sys.time()
+```
+

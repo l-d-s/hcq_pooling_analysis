@@ -1,0 +1,864 @@
+---
+author: "Leon Di Stefano"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    keep_md: false
+params:
+  fit_name: "main_fit"
+  outcome_min: 28
+  outcome_max: 35
+title: "`r paste0('Outcome model check - ', params$outcome_min, params$outcome_max, params$fit_name, sep = '-')`"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+require(here)
+require(brms)
+require(tidybayes)
+require(mice)
+here::i_am(file.path("hcq_pooling_analysis", "3b_Outcome_model_check.Rmd"))
+source(here("hcq_pooling_analysis", "common.R"))
+
+out_stub <- paste(params$outcome_min, params$outcome_max, sep = '-')
+output_dir <- here("hcq_pooling_analysis", "output", out_stub)
+
+output_model_dir <- file.path(output_dir, params$fit_name)
+
+fit_file <- file.path(output_model_dir, paste0(params$fit_name, ".rds"))
+```
+
+```{r}
+params
+```
+
+```{r}
+brm_fit <- read_rds(fit_file)
+
+data_tbl <- read_rds(file.path(output_dir, "data_tbl.rds"))
+
+mice_df_list <- read_rds(file.path(output_dir, "mice_complete_df_list.rds"))
+```
+
+```{r}
+summary(brm_fit)
+```
+
+There appear to be Rhat issues with the spline terms:
+
+```{r fig.height=20, fig.width=20}
+# mcmc_rank_hist(brm_fit, regex_pars = "splines::nsbmi")
+```
+
+Cf. the [official guidance](https://mc-stan.org/rstan/reference/Rhat.html):
+
+> We recommend running at least four chains by default and only using the sample if R-hat is less than 1.05.
+
+I suspect that part of the problem is comparing chains *between imputations*, where *the imputation makes a big difference to the fit of a given spline component*.
+
+The `brm_multiple` object conveniently stores the imputation-wise R hats:
+
+```{r}
+brm_fit$rhats %>% 
+  as_tibble()
+```
+
+```{r fig.height = 12, fig.width = 7}
+brm_fit$rhats %>% 
+  as_tibble() %>% 
+  rownames_to_column("imputation") %>% 
+  pivot_longer(
+    names_to = "variable", 
+    values_to = "rhat", 
+    -imputation) %>% 
+  qplot(variable, rhat, 
+        label = imputation, 
+        data = ., geom = "text") + 
+  geom_hline(yintercept = c(1, 1.01), 
+             color = "grey80") + 
+  coord_flip()
+```
+
+Have a look at the Stan code:
+
+```{r}
+brm_fit$model
+```
+
+Decorate with types using `tidybayes`:
+
+```{r}
+brm_fit <- recover_types(brm_fit)
+```
+
+Could replace with an ANOVA plot, as these all have different units:
+
+```{r fig.height=8, fig.width=10}
+tibble(
+  brms::posterior_summary(brm_fit) %>% 
+    as.data.frame() %>% 
+    rownames_to_column("var")) %>% 
+  filter(str_detect(var, "b_|r_")) %>% 
+  mutate(treat = ifelse(str_detect(var, "treatHCQ"), "treat", "non-treat"),
+         splines = ifelse(str_detect(var, "splines"), "spline", "non-spline"),
+         intercept = ifelse(str_detect(var, "Intercept"), "intercept", "non-intercept")) %>%
+  ggplot(aes(
+    var,
+    y = Estimate, 
+    ymin = Q2.5, 
+    ymax = Q97.5)) + 
+  geom_hline(yintercept = c(-1, 0, 1), linetype = "dotted") + 
+  geom_pointrange() +
+  facet_grid(. ~ treat + intercept + splines, 
+             scales = "free", space = "free") +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5)) 
+        # strip.text.y = element_blank(),
+  #       strip.background = element_blank())
+```
+
+Removing the splines and Intercepts might be sensible:
+
+```{r fig.height=8, fig.width=10}
+tibble(
+  brms::posterior_summary(brm_fit) %>% 
+    as.data.frame() %>% 
+    rownames_to_column("var")) %>% 
+  filter(str_detect(var, "b_|r_"),
+         !str_detect(var, "splines"),
+         !str_detect(var, "b_Intercept")) %>% 
+  mutate(treat = ifelse(str_detect(var, "treatHCQ"), "treat", "non-treat"),
+         splines = ifelse(str_detect(var, "splines"), "spline", "non-spline"),
+         intercept = ifelse(str_detect(var, "Intercept"), "intercept", "non-intercept")) %>%
+  ggplot(aes(
+    var,
+    y = Estimate, 
+    ymin = Q2.5, 
+    ymax = Q97.5)) + 
+  geom_hline(yintercept = c(-1, 0, 1), linetype = "dotted") + 
+  geom_pointrange() +
+  facet_grid(. ~ treat + intercept + splines, 
+             scales = "free", space = "free") +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5)) 
+        # strip.text.y = element_blank(),
+  #       strip.background = element_blank())
+```
+
+### Plots of treatment interactions
+
+
+```{r fig.height=8, fig.width=10}
+tibble(
+  brms::posterior_summary(brm_fit) %>% 
+    as.data.frame() %>% 
+    rownames_to_column("var")) %>% 
+  filter(str_detect(var, "b_|r_"),
+         !str_detect(var, "splines"),
+         !str_detect(var, "b_Intercept")) %>% 
+  mutate(treat = ifelse(str_detect(var, "treatHCQ"), "treat", "non-treat"),
+         splines = ifelse(str_detect(var, "splines"), "spline", "non-spline"),
+         intercept = ifelse(str_detect(var, "Intercept"), "intercept", "non-intercept")) %>%
+  filter(treat == "treat") %>%
+  ggplot(aes(
+    var,
+    y = Estimate, 
+    ymin = Q2.5, 
+    ymax = Q97.5)) + 
+  geom_hline(yintercept = c(-1, 0, 1), linetype = "dotted") + 
+  geom_pointrange() +
+  facet_grid(. ~ treat + intercept + splines, 
+             scales = "free", space = "free") +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5)) 
+        # strip.text.y = element_blank(),
+  #       strip.background = element_blank())
+```
+
+### Plots of site effects
+
+```{r}
+site_effects <- gather_draws(
+  brm_fit, 
+  r_siteid[siteid, covariate]) %>%
+  mutate(covariate = case_when(covariate == "Intercept" ~ "control",
+                               covariate == "treatHCQ"  ~ "treatment effect\n(HC/CQ vs control)")) %>%
+  ggplot(aes(siteid, .value)) +
+  geom_hline(yintercept = 0, color = "grey80") +
+  stat_pointinterval() +
+  ylab("study coefficient\n(contextual effects)") +
+  xlab("") +
+  coord_flip() +
+  facet_rep_grid(covariate~.)
+
+site_effects
+
+ggsave(file.path(output_model_dir, "site_effects.png"), site_effects)
+ggsave(file.path(output_model_dir, "site_effects.svg"), site_effects)
+#ggsave(file.path(output_model_dir, "site_effects.svg"), site_effects)
+```
+
+### LOO/IC diagnostics
+
+See the "glossary" for more on the meaning of these.
+
+Bayesian $R^2$ (note the warnings):
+
+```{r}
+brms::bayes_R2(brm_fit)
+```
+
+```{r}
+loo_fit <- loo(brm_fit, reloo = TRUE)
+```
+
+```{r}
+loo_fit
+```
+
+There are 2 x 11 = 22 parameters in the model, plus the 8 siteid and 4 baseline niaid random effects, giving p $\approx$ 34. 
+
+
+Note that this only works with the first imputed dataset.
+
+```{r}
+plot(loo_fit)
+```
+
+The trend makes it seem like individuals from the smaller sites have higher influence over the model—despite the site effects all being apparently rather small. Actually, it could be that this diagnostic assumes conditional independence of the responses given the parameters.
+
+Why are there only 732 patients here? Because the diagnostic only makes sense for non-missing outcomes.
+
+```{r}
+ncol(loo_fit)
+```
+
+```{r}
+write_rds(loo_fit, file.path(output_model_dir, paste0("loo_fit_", params$fit_name, ".rds")))
+```
+
+Who are the influential patients?
+
+```{r}
+data_tbl %>% 
+  filter(!is.na(niaid_outcome)) %>% 
+  slice(loo::pareto_k_ids(loo_fit, threshold = .5)) %>%
+  select(siteid, patient_id, age_5y, bmi, comorbidity_count, niaid_baseline_fct, niaid_outcome)
+```
+
+```{r}
+loo_tbl <-
+  data_tbl %>% 
+  filter(!is.na(niaid_outcome)) %>% 
+  slice(loo::pareto_k_ids(loo_fit, threshold = -Inf)) %>%
+  mutate(pareto_k_inf = loo::pareto_k_influence_values(loo_fit))
+
+loo_tbl %>%
+  qplot(siteid, pareto_k_inf, geom = "boxplot",
+        data = .)
+```
+
+Trend looks to potentially be just a consequence of the sample size of the site, i.e. the hierarchical/non-iid nature of the model.
+
+### Posterior predictive checks
+
+One of the brms defaults, a marginal posterior predictive check:
+
+```{r}
+pp_check(brm_fit, type = "bars_grouped", group = c("treat")) +
+  scale_x_continuous(breaks = 1:7, labels = niaid_levels) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5))
+```
+
+Augment the data with posterior predictive draws for PP checks [**need to map over multiply imputed datasets**]:
+
+```{r}
+n_pp_draws <- 100 # interacts with #imputations
+
+ppc_tbl_all_imputations <-
+  imap(
+    mice_df_list,
+    function(x, imputation_no # Need to take account of this to deal with repeated
+                              # .draw indices
+             ) {
+      add_predicted_draws(
+        x, 
+        brm_fit, n = n_pp_draws # Need to set this taking into account the number of imputations
+        ) %>%
+        ungroup() %>%
+        mutate(.prediction = factor(.prediction, ordered = TRUE),
+               .imp = imputation_no)
+    }
+  ) %>%
+  bind_rows() %>%
+  mutate(.draw = str_c(.imp, "_", .draw))
+
+
+ppc_tbl <-
+  left_join(
+    data_tbl,
+    ppc_tbl_all_imputations %>% 
+      select(patient_id, .row, .chain, .draw, .prediction, .imp))
+    
+```
+
+## Annotate `data_tbl` with linear predictors
+
+Add mean linear predictors:
+
+```{r}
+expected_linear_predictors <- 
+  map(mice_df_list,
+      (function(x) posterior_linpred(brm_fit, newdata = x))) %>%
+  do.call(rbind, .) %>%
+  colMeans()
+
+data_tbl <- data_tbl %>% mutate(lin_pred = expected_linear_predictors)
+
+ppc_tbl <-
+  ppc_tbl %>%
+  left_join(data_tbl %>% select(patient_id, lin_pred))
+```
+
+We also want the linear predictors under control, and under treatment:
+
+```{r}
+expected_linear_predictors_control <- 
+  map(mice_df_list,
+      (function(x) {
+        x %>%
+          mutate(treat = "no_HCQ") %>%
+          posterior_linpred(brm_fit, newdata = .)
+        })) %>%
+  do.call(rbind, .) %>%
+  colMeans()
+
+data_tbl <- data_tbl %>% 
+  mutate(lin_pred_control = expected_linear_predictors_control)
+
+expected_linear_predictors_treatment <- 
+  map(mice_df_list,
+      (function(x) {
+        x %>%
+          mutate(treat = "HCQ") %>%
+          posterior_linpred(brm_fit, newdata = .)
+        })) %>%
+  do.call(rbind, .) %>%
+  colMeans()
+
+data_tbl <- data_tbl %>% 
+  mutate(
+    lin_pred_treatment = expected_linear_predictors_treatment,
+    lin_pred = ifelse(treat == "HCQ", lin_pred_treatment, lin_pred_control))
+
+```
+
+Also add these to the PPC table:
+
+```{r}
+ppc_tbl <-
+  ppc_tbl %>%
+  left_join(data_tbl %>% select(patient_id, lin_pred_control, lin_pred_treatment))
+```
+
+Write this out:
+
+```{r}
+write_rds(ppc_tbl, file.path(output_model_dir, paste0("posterior_predictive_check_tbl_", params$fit_name, ".rds")))
+```
+
+Examine the difference in the individual-level treat and control predictors:
+
+```{r}
+qplot(lin_pred_control, lin_pred_treatment, 
+      data = data_tbl, size = I(0.5)) +
+  theme(aspect.ratio = 1) +
+  geom_abline(color = "orange")
+```
+
+```{r}
+qplot(lin_pred_control, lin_pred_treatment - lin_pred_control, 
+      data = data_tbl, size = I(0.5)) +
+  geom_hline(yintercept = 0, color = "orange")
+```
+
+
+Use this to plot Smyth-Dunn randomized z-residuals against linear predictor (via `https://cran.r-project.org/web/packages/tidybayes/vignettes/tidybayes-residuals.html`):
+
+```{r}
+smyth_dunn_tbl <-
+  ppc_tbl %>% 
+  group_by(.row, patient_id) %>%
+  summarise(
+    p_lower = mean(.prediction < niaid_outcome),
+    p_upper = mean(.prediction <= niaid_outcome),
+    p_residual = runif(1, p_lower, p_upper),
+    z_residual = qnorm(p_residual)
+  ) 
+```
+
+```{r}
+smyth_dunn_tbl %>%
+  left_join(data_tbl %>% select(patient_id, lin_pred, niaid_outcome)) %>%
+  ggplot(aes(x = lin_pred, y = z_residual, 
+             # color = niaid_outcome
+             )) +
+  geom_hline(yintercept = 0, color = "grey50") +
+  geom_point(size = I(0.5))
+```
+
+```{r}
+smyth_dunn_tbl %>%
+  ggplot(aes(sample = z_residual)) +
+  stat_qq() +
+  stat_qq_line(color = "orange")
+```
+
+Combine with the actual outcomes in long form, for faceted plotting (also select only a few PP draws):
+
+```{r}
+n_ppc_draws <- 9
+
+draw_selection <- sample(unique(ppc_tbl$.draw), n_ppc_draws)
+
+ppc_plus_obs_tbl <-
+  ppc_tbl %>%
+  filter(.draw %in% draw_selection) %>%
+  bind_rows(
+    ppc_tbl %>% 
+      filter(.draw == "1_1") %>%
+      mutate(.draw = "actual",
+             .prediction = niaid_outcome)) %>%
+  mutate(actual_vs_sim = ifelse(.draw == "actual", "actual", "simulated"))
+```
+
+
+### 0: PPC against linear predictor
+
+```{r}
+gg_niaid_scatter(lin_pred, 
+      niaid_outcome,
+      data = data_tbl)
+```
+
+```{r}
+gg_niaid_scatter(lin_pred_control, 
+      niaid_outcome,
+      data = data_tbl) +
+  facet_grid(treat~.)
+```
+
+Another version of this plot:
+
+```{r fig.height=2.5, fig.width=7}
+ggplot(aes(cut(lin_pred, 20), niaid_outcome), 
+       data = data_tbl) + 
+  geom_count() +
+  theme(axis.text.x = element_blank())
+```
+
+```{r fig.height=4, fig.width=8}
+ggplot(aes(cut(lin_pred_control, 20), niaid_outcome), 
+       data = data_tbl) + 
+  geom_count() +
+  theme(axis.text.x = element_blank()) +
+  facet_rep_grid(treat~.)
+```
+
+Bar plots by quintiles of "baseline risk":
+
+```{r}
+baseline_risk_bars <- 
+  ggplot(aes(treat, fill = niaid_outcome), 
+       data = 
+         data_tbl %>%
+         filter(!is.na(niaid_outcome)) %>%
+         mutate(risk_quintile = ntile(lin_pred_control, 5))) + 
+  facet_grid(~risk_quintile) + 
+  geom_bar(position = position_fill()) +
+  scale_fill_manual(values = niaid_colors) +
+  scale_y_continuous(labels = scales::percent,
+                     expand = expansion(0)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5))
+
+baseline_risk_bars
+```
+
+Add missingness to this:
+
+```{r}
+baseline_risk_missingness <-
+  ggplot(aes(treat), 
+       data = 
+         data_tbl %>%
+         filter(is.na(niaid_outcome))) + 
+  facet_grid(~ntile(lin_pred_control, 5)) + 
+  geom_bar() +
+  scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5))
+
+baseline_risk_missingness
+```
+
+Would seem better to just add the table down the bottom:
+
+```{r}
+baseline_risk_ns <-
+  data_tbl %>%
+  mutate(risk_quintile = ntile(lin_pred_control, 5)) %>%
+  group_by(risk_quintile, treat) %>%
+  summarise(
+    n = n(),
+    `outcome missing` = sum(is.na(niaid_outcome))
+  ) %>%
+  pivot_longer(-c(risk_quintile, treat)) %>%
+  ggplot(aes(treat, name)) +
+  geom_text(aes(label = value), size = 4) +
+  facet_grid(~risk_quintile) +
+  coord_fixed()
+
+baseline_risk_ns
+```
+
+Compiling these:
+
+```{r}
+require(patchwork)
+
+(baseline_risk_bars + 
+    # guides(fill = "none") + 
+    theme(
+  # axis.text.x = element_blank(),
+  # axis.ticks.x = element_blank(), 
+  axis.title.x = element_blank()
+)) / (baseline_risk_ns +
+        theme(axis.text.x = element_text(angle = 90, vjust = .5),
+              strip.text = element_blank(),
+              axis.line.y = element_blank(),
+              axis.title.y = element_blank(),
+              axis.ticks.y = element_blank(),
+              axis.title.x = element_blank()))
+```
+
+Yet another version, with boxplots:
+
+
+```{r fig.width=13, fig.height=8}
+gg_niaid_scatter(lin_pred, as.numeric(.prediction), data = ppc_plus_obs_tbl) +
+  facet_wrap(~actual_vs_sim + .draw) +
+  geom_rect(aes(color = actual_vs_sim),
+            xmin = -Inf, xmax = Inf,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0) +
+  scale_color_manual(values = c(actual = "orange", simulated = "grey80")) +
+  # geom_smooth(se = FALSE, size = .8) +
+  scale_y_continuous(breaks = 1:7, labels = niaid_levels) +
+  theme(axis.line.y = element_blank())
+```
+
+```{r fig.height=16, fig.width=20}
+ppc_scatter_by_site <- 
+  gg_niaid_scatter(lin_pred, as.numeric(.prediction), data = ppc_plus_obs_tbl) +
+  facet_grid(actual_vs_sim + .draw ~ siteid) +
+  geom_rect(aes(color = actual_vs_sim),
+            xmin = -Inf, xmax = Inf,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0) +
+  scale_color_manual(values = c(actual = "orange", simulated = "grey80")) +
+  # geom_smooth(se = FALSE, size = .8) +
+  scale_y_continuous(breaks = 1:7, labels = niaid_levels) +
+  theme(axis.line.y = element_blank())
+
+ppc_scatter_by_site
+
+ggsave(file.path(output_model_dir, "ppc_scatter_by_site.png"), ppc_scatter_by_site, height = 16, width = 20)
+ggsave(file.path(output_model_dir, "ppc_scatter_by_site.svg"), ppc_scatter_by_site, height = 16, width = 20)
+```
+
+Linear predictor against key covariaties:
+
+```{r fig.width = 10, fig.height = 3}
+plot_grid(
+  qplot(age_5y, lin_pred_control, data = data_tbl, geom = "jitter",
+      size = I(0.5)),
+  qplot(niaid_baseline_numeric_model, lin_pred_control, data = data_tbl, geom = "jitter",
+      size = I(0.5)),
+  qplot(bmi, lin_pred_control, data = data_tbl, geom = "point",
+      size = I(0.5)),
+  qplot(comorbidity_count, lin_pred_control, data = data_tbl, geom = "jitter",
+      size = I(0.5)),
+  nrow = 1
+)
+```
+
+```{r fig.width = 10, fig.height = 3}
+plot_grid(
+  qplot(age_5y, lin_pred_control, data = data_tbl, geom = "jitter",
+      size = I(0.5), color = treat) + guides(color = FALSE),
+  qplot(niaid_baseline_numeric_model, lin_pred_control, data = data_tbl, geom = "jitter",
+      size = I(0.5), color = treat) + guides(color = FALSE),
+  qplot(bmi, lin_pred_control, data = data_tbl, geom = "point",
+      size = I(0.5), color = treat) + guides(color = FALSE),
+  qplot(comorbidity_count, lin_pred_control, data = data_tbl, geom = "jitter",
+      size = I(0.5), color = treat) + guides(color = FALSE),
+  nrow = 1
+)
+```
+
+
+```{r}
+qplot(lin_pred_control, age_5y, data = data_tbl, geom = "jitter",
+      size = I(0.5), color = niaid_baseline_fct)
+```
+
+Exploratory ANOVA for which variables explain (1) linear predictor; (2) outcome:
+
+```{r}
+lin_pred_anova_tbl <-
+  anova(
+  lm(lin_pred_control ~ ., 
+     data = data_tbl %>% 
+       select(
+         -siteid, -patient_id, -lin_pred, -niaid_outcome, -lin_pred_treatment))) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("source") %>% 
+  as_tibble()
+
+lin_pred_anova_tbl %>% qplot(`Mean Sq`, reorder(source, `Mean Sq`), geom = "col", data = .) +
+  scale_x_continuous(expand = expansion(c(0, .2)))
+```
+
+```{r}
+outcome_anova_tbl <-
+  anova(
+    lm(as.numeric(niaid_outcome) ~ ., 
+       data = data_tbl %>% 
+           select(
+               -siteid, -patient_id, 
+               -lin_pred, -lin_pred_treatment, -lin_pred_control))) %>% 
+    as.data.frame() %>% 
+    rownames_to_column("source") %>% 
+    as_tibble()
+
+outcome_anova_tbl%>% 
+    qplot(`Mean Sq`, reorder(source, `Mean Sq`), geom = "col", data = .) +
+    scale_x_continuous(expand = expansion(c(0, .2)))
+```
+
+```{r}
+bind_rows(outcome_anova_tbl %>% mutate(anova = "outcome"),
+          lin_pred_anova_tbl %>% mutate(anova = "linear predictor")) %>%
+  select(anova, `Mean Sq`, source) %>%
+  pivot_wider(names_from = "anova", values_from = "Mean Sq") %>%
+  ggplot(aes(sqrt(outcome), sqrt(`linear predictor`)), data = .) +
+  geom_label(aes(label = source), label.size = .2)
+```
+
+```{r fig.height=3.5, fig.width=5}
+qplot(niaid_baseline_fct, lin_pred, data = data_tbl, geom = "boxplot") +
+  coord_flip()
+```
+
+Linear predictor by treatment:
+
+```{r fig.height=16, fig.width=7}
+qplot(age_5y, as.numeric(.prediction), data = ppc_plus_obs_tbl, 
+      geom = "jitter", size = I(0.3), alpha = I(1),
+      width = I(1.5)) +
+  facet_grid(.draw~treat) +
+  geom_rect(aes(linetype = actual_vs_sim),
+            xmin = -Inf, xmax = Inf,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0, size = .7, color = "grey60") +
+  scale_linetype_manual(values = c(actual = "solid", simulated = "dotted")) +
+  geom_smooth(se = FALSE, size = .8) +
+  scale_y_continuous(breaks = 1:7, labels = niaid_levels) +
+  theme(axis.line = element_blank(),
+        strip.background = element_blank())
+```
+
+### 1: PPC against age
+
+```{r}
+gg_niaid_scatter(age_5y, niaid_outcome, data = data_tbl)
+```
+
+Is it the case that an older participant would basically never be put on mech vent/ECMO, especially after a month in hospital?
+
+
+```{r fig.height=7, fig.width=15}
+ppc_plus_obs_tbl %>%
+  gg_niaid_scatter(age_5y, .prediction) +
+  facet_wrap(~actual_vs_sim + .draw) +
+  geom_rect(aes(linetype = actual_vs_sim),
+            xmin = -Inf, xmax = Inf,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0, size = .7, color = "grey60") +
+  scale_linetype_manual(values = c(actual = "solid", simulated = "dotted")) +
+  geom_smooth(se = FALSE, size = .8, 
+              aes(x = age_5y, y = as.numeric(.prediction))) +
+  theme(axis.line = element_blank(), 
+        strip.background = element_blank(),
+        strip.text = element_blank())
+```
+
+```{r fig.height=15, fig.width=7}
+ppc_plus_obs_tbl %>%
+  gg_niaid_scatter(age_5y, .prediction) +
+  facet_grid(.draw~treat) +
+  geom_rect(aes(linetype = actual_vs_sim),
+            xmin = -Inf, xmax = Inf,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0, size = .7, color = "grey60") +
+  scale_linetype_manual(values = c(actual = "solid", simulated = "dotted")) +
+  geom_smooth(se = FALSE, size = .8, 
+              aes(x = age_5y, y = as.numeric(.prediction))) +
+  theme(axis.line = element_blank(),
+        strip.background = element_blank())
+```
+
+```{r fig.height=8, fig.width=12}
+ppc_plus_obs_tbl %>%
+  filter(.draw <= 5 | .draw == "actual") %>%
+  gg_niaid_scatter(age_5y, .prediction) +
+  facet_grid(.draw~siteid) +
+  geom_rect(aes(linetype = actual_vs_sim),
+            xmin = -Inf, xmax = Inf,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0, size = .7, color = "grey60") +
+  scale_linetype_manual(values = c(actual = "solid", simulated = "dotted")) +
+  # geom_smooth(se = FALSE, size = .8) +
+  theme(axis.line = element_blank(),
+        strip.background = element_blank())
+```
+
+## Checking spline conditional effects/coefficients
+
+Examine fitted age and BMI curves:
+
+```{r}
+reference_tbl <-
+  tibble(
+    sex_model = 0,
+    age_model = 0,
+    bmi_model = 0,
+    comorbidity_count = 0,
+    niaid_baseline_numeric_model = 0,
+    niaid_baseline_fct = "5 - hosp, no ox",
+    # For expanded SAP model; otherwise unused
+    azithro = FALSE,
+    sym_onst_days_bfr_enrdt = 6 # the median
+  )
+```
+
+
+### Age
+
+Something to think about here: when there's a bunch of uncertainty in the cutpoints/intercepts, does uncertainty in the linear predictor capture what we're after when we think "effect"? It might depend on how much we trust the latent variable construct.
+
+```{r}
+tidyr::expand_grid(
+  reference_tbl,
+  age = 18:90,
+  treat = c("HCQ", "no_HCQ")
+) %>%
+  mutate(age_model = (age - 60)/10) %>%
+  add_fitted_draws(brm_fit, re_formula = ~niaid_baseline_fct, scale = "linear") %>%
+  ggplot(aes(age, .value)) +
+  stat_lineribbon() +
+  facet_rep_grid(treat~.) +
+  scale_fill_brewer(palette = "Greys")
+```
+
+```{r}
+tidyr::expand_grid(
+  reference_tbl,
+  age = 18:90,
+  treat = c("HCQ", "no_HCQ")
+) %>%
+  mutate(age_model = (age - 60)/10) %>%
+  add_fitted_draws(brm_fit, re_formula = ~niaid_baseline_fct, scale = "linear",
+                   n = 20) %>%
+  ggplot(aes(age, .value)) +
+  geom_line(aes(group = paste(treat, .draw)),
+            alpha = .3, size = .5) +
+  facet_rep_grid(treat~.)
+```
+
+### BMI
+
+```{r}
+tidyr::expand_grid(
+  reference_tbl,
+  bmi = 10:100,
+  treat = c("HCQ", "no_HCQ")
+) %>%
+  mutate(bmi_model = (bmi - 25)/5) %>%
+  add_fitted_draws(brm_fit, re_formula = ~niaid_baseline_fct, scale = "linear") %>%
+  ggplot(aes(bmi, .value)) +
+  stat_lineribbon() +
+  facet_rep_grid(treat~.) +
+  scale_fill_brewer(palette = "Greys")
+```
+
+```{r}
+tidyr::expand_grid(
+  reference_tbl,
+  bmi = 10:100,
+  treat = c("HCQ", "no_HCQ")
+) %>%
+  mutate(bmi_model = (bmi - 25)/5) %>%
+  add_fitted_draws(brm_fit, re_formula = ~niaid_baseline_fct, scale = "linear",
+                   n = 20) %>%
+  ggplot(aes(bmi, .value)) +
+  geom_line(aes(group = paste(treat, .draw)),
+            alpha = .3, size = .5) +
+  facet_rep_grid(treat~.)
+```
+
+### Comorbidity count
+
+```{r}
+tidyr::expand_grid(
+  reference_tbl %>% select(-comorbidity_count),
+  comorbidity_count = 0:10,
+  treat = c("HCQ", "no_HCQ")
+) %>%
+  add_fitted_draws(brm_fit, re_formula = ~niaid_baseline_fct, scale = "linear") %>%
+  ggplot(aes(comorbidity_count, .value)) +
+  stat_lineribbon() +
+  facet_rep_grid(treat~.) +
+  scale_fill_brewer(palette = "Greys")
+```
+
+A sample of the curves:
+
+```{r}
+tidyr::expand_grid(
+  reference_tbl %>% select(-comorbidity_count),
+  comorbidity_count = 0:10,
+  treat = c("HCQ", "no_HCQ")
+) %>%
+  add_fitted_draws(brm_fit, re_formula = ~niaid_baseline_fct, scale = "linear",
+                   n = 20) %>%
+  ggplot(aes(comorbidity_count, .value)) +
+  geom_line(aes(group = paste(treat, .draw)),
+            alpha = .3, size = .5) +
+  facet_rep_grid(treat~.)
+```
+
+## Write out annotated data table (esp. for linear predictors)
+
+
+```{r}
+write_rds(data_tbl, file.path(output_model_dir, "data_tbl_annotated.rds"))
+```
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+```{r}
+Sys.time()
+```
+

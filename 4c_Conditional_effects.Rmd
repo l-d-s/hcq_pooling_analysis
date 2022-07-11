@@ -1,0 +1,457 @@
+---
+author: "Leon Di Stefano"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+      keep_md: false
+params:
+  fit_name: "main_fit"
+  outcome_min: 28
+  outcome_max: 35
+title: "`r paste0('Conditional effects - ', params$out_stub, params$fit_name, sep = '-')`"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+require(here)
+here::i_am(file.path("hcq_pooling_analysis", "4c_Conditional_effects.Rmd"))
+source(here("hcq_pooling_analysis", "common.R"))
+require(brms)
+require(tidybayes)
+require(mice)
+require(bayesplot)
+require(patchwork)
+
+bayesplot_theme_set(theme_cowplot())
+bayesplot_theme_update(
+  strip.background = element_blank(),
+  strip.text.y = element_text(angle = 0),
+  strip.text = element_text(face = "bold")
+)
+
+require(MASS, exclude = "select") # clashes with dplyr
+
+out_stub         <- paste(params$outcome_min, params$outcome_max, sep = '-')
+output_dir       <- here("hcq_pooling_analysis", "output", out_stub)
+output_model_dir <- file.path(output_dir, params$fit_name)
+fit_file         <- file.path(output_model_dir, paste0(params$fit_name, ".rds"))
+
+conditional_effect_dir <-
+  file.path(output_model_dir, "conditional_effects")
+
+if (!dir.exists(conditional_effect_dir)) {
+  dir.create(conditional_effect_dir)
+}
+```
+
+```{r}
+brm_fit <- read_rds(fit_file)
+```
+
+Create a reference table; this will be expanded for each conditional effect:
+
+```{r}
+reference_tbl <-
+  tibble(
+    treat = factor(c("no_HCQ", "HCQ"), levels = c("no_HCQ", "HCQ")),
+    sex_model = 0,
+    age_model = 0,
+    bmi_model = 0,
+    comorbidity_count = 0,
+    niaid_baseline_numeric_model = 0,
+    niaid_baseline_fct = "5 - hosp, no ox",
+    
+    # For expanded SAP model; otherwise unused
+    azithro = FALSE,
+    sym_onst_days_bfr_enrdt = 6 # the median
+  )
+```
+
+### Generic functions for continuous covariates
+
+```{r}
+y_scale_percent <-
+  scale_y_continuous(limits = c(0, 1), 
+                     labels = scales::percent,
+                     breaks = (1:4)/4,
+                     expand = expansion(0))
+
+conditional_analysis_tables <- 
+  function(reference_table, model_fit, covariate_display) {
+    conditional_tbl_pis <-
+      add_fitted_draws(
+        model_fit, newdata = reference_table ,
+         # marginalize over contextual study effects
+         re_formula = ~niaid_baseline_fct,
+         scale = "response",
+         # from the documentation for `add_fitted_draws` it seems
+         # this might be necessary (though possibly only if we were adding
+         # a dummy `studyid`)
+          allow_new_levels = TRUE
+         )
+  
+    conditional_tbl_12_rr <-
+      conditional_tbl_pis %>%
+      mutate(.category = as.numeric(substr(.category, 1, 2))) %>%
+      group_by({{covariate_display}}, .draw) %>%
+      summarise(prob_12_HCQ    = sum(.value*(treat == "HCQ")   *((.category == 1) + (.category == 2))),
+                prob_12_no_HCQ = sum(.value*(treat == "no_HCQ")*((.category == 1) + (.category == 2))),
+                rr = prob_12_HCQ/prob_12_no_HCQ)
+    
+    condition_tbl_linpred_diff <-
+      add_linpred_draws(brm_fit, newdata = reference_table, 
+                        re_formula = ~niaid_baseline_fct, scale = "linear") %>%
+      ungroup() %>%
+      group_by({{covariate_display}}, .draw) %>%
+      summarise(lin_pred_diff = .value[treat == "HCQ"] - .value[treat == "no_HCQ"])
+      # summarise(lin_pred_diff = .linpred[treat == "HCQ"] - .linpred[treat == "no_HCQ"])
+    
+    return(list(pi_tbl = conditional_tbl_pis,
+                rr_tbl = conditional_tbl_12_rr,
+                linpred_diff_tbl = condition_tbl_linpred_diff))
+  }
+
+pi_plot <- function(pi_draws, covariate_display, ref_level_display = NULL) {
+  pi_draws %>%
+  mutate(.category = as.numeric(substr(.category, 1, 2))) %>%
+  filter(.category %in% c(1,2)) %>%
+  group_by({{covariate_display}}, treat, .draw) %>%
+  mutate(prob_12 = sum(.value)) %>%
+  mutate(
+    treat = factor(treat,
+                   levels = c("no_HCQ", "HCQ"), 
+                   labels = c("control", "HC/CQ"))) %>%
+  ggplot(aes({{covariate_display}}, prob_12)) +
+    facet_grid(treat~.) +
+    stat_lineribbon(.width = c(.5, .95)) +
+    scale_fill_brewer(palette = "Blues") +
+    y_scale_percent +
+    scale_x_continuous(expand = expansion(0)) +
+    ylab("") +
+    theme(panel.border = element_rect(color = "black", size = 1),
+          axis.line = element_blank()) +
+    geom_hline(yintercept = c(.25, .5, .75), color = "white") +
+  geom_vline(xintercept = ref_level_display, 
+             color = colorspace::lighten("forestgreen"), 
+             size = 1) }
+
+rr_plot <- function(rr_draws, covariate_display, ref_level_display = NULL) {
+  rr_draws %>% 
+  ggplot(aes({{covariate_display}}, rr)) + 
+  stat_lineribbon(.width = c(.5, .95)) + 
+  scale_y_log10() +
+  scale_fill_brewer(palette = "Blues") + 
+  geom_hline(yintercept = 1, color = "orange", size = 1) +
+  ylab("relative risk of mechanical\nventilation or death\n(reference individuals)") +
+  scale_x_continuous(expand = expansion(0)) +
+  geom_vline(xintercept = ref_level_display, 
+             color = colorspace::lighten("forestgreen"), 
+             size = 1)
+}
+
+lin_pred_plot <-
+  function(linpred_diff_draws, covariate_display, ref_level_display = NULL) {
+    linpred_diff_draws %>%
+    ggplot(aes({{covariate_display}}, lin_pred_diff)) + 
+  stat_lineribbon(.width = c(.5, .95)) + 
+  scale_fill_brewer(palette = "Blues") + 
+  geom_hline(yintercept = 0, color = "orange", size = 1) +
+  ylab("treatment effect (log proportional odds ratio) \n(reference individuals)") +
+  scale_x_continuous(expand = expansion(0)) +
+  geom_vline(xintercept = ref_level_display, 
+             color = colorspace::lighten("forestgreen"), 
+             size = 1)
+  }
+```
+
+### BMI
+
+```{r}
+conditional_tables_bmi <-
+  tidyr::expand_grid(
+      reference_tbl,
+      bmi = seq(15, 80, 5)
+    ) %>%
+    mutate(bmi_model = (bmi - 25)/5) %>%
+  conditional_analysis_tables(brm_fit, bmi)
+```
+
+
+
+```{r fig.height=12, fig.width=6}
+bmi_plots_stacked <-
+  ((rr_plot(conditional_tables_bmi$rr_tbl, bmi, ref_level_display = 25) + scale_y_log10()) /
+  pi_plot(conditional_tables_bmi$pi_tbl, bmi, ref_level_display = 25) /
+  lin_pred_plot(conditional_tables_bmi$linpred_diff_tbl, bmi, ref_level_display = 25)) +
+  plot_annotation("Conditional effects - BMI")
+
+bmi_plots_stacked
+ggsave(file.path(conditional_effect_dir, "bmi_stacked.png"), bmi_plots_stacked, height = 12, width = 6)
+ggsave(file.path(conditional_effect_dir, "bmi_stacked.svg"), bmi_plots_stacked, height = 12, width = 6)
+```
+
+
+### Baseline NIAID
+
+```{r}
+conditional_tables_baseline_niaid <-
+  reference_tbl %>%
+  select(-niaid_baseline_fct, -niaid_baseline_numeric_model) %>%
+  tidyr::expand_grid(
+      tibble(
+        niaid_baseline_fct = niaid_levels[2:5],
+        niaid_baseline_numeric_model = 3:0
+      )
+    ) %>%
+  conditional_analysis_tables(brm_fit, niaid_baseline_fct)
+```
+
+### Functions for discrete covariates
+
+```{r}
+pi_plot_discrete <- function(pi_draws, covariate_display, ref_level_display) {
+  x_val <- ref_level_display
+  alpha_val <- .01
+
+  if(!is.null(ref_level_display)) {
+  pi_draws %>%
+    mutate(.category = as.numeric(substr(.category, 1, 2))) %>%
+    filter(.category %in% c(1,2)) %>%
+    group_by({{covariate_display}}, treat, .draw) %>%
+    mutate(prob_12 = sum(.value)) %>%
+    mutate(
+      treat = factor(treat,
+                     levels = c("no_HCQ", "HCQ"), 
+                     labels = c("control", "HC/CQ"))) %>%
+    ggplot(aes({{covariate_display}}, prob_12)) +
+      background_grid(major = "y", color.major = "grey90") +
+      facet_rep_grid(treat~.) +
+    geom_tile(
+      aes(x = x_val, 
+          y = .5, height = Inf, width = 1), 
+      alpha = alpha_val, 
+      fill = colorspace::lighten("forestgreen")) +
+    stat_pointinterval(.width = c(.5, .95)) +
+    # scale_fill_brewer(palette = "Greys") +
+    y_scale_percent +
+    # scale_x_continuous(expand = expansion(0)) +
+    ylab("probability of mechanical\nventilation or death\n(reference individuals)")
+    # theme(panel.border = element_rect(color = "black", size = 1),
+    #       axis.line = element_blank()) +
+    # geom_hline(yintercept = c(.25, .5, .75), color = "white") 
+  } else {
+    pi_draws %>%
+    mutate(.category = as.numeric(substr(.category, 1, 2))) %>%
+    filter(.category %in% c(1,2)) %>%
+    group_by({{covariate_display}}, treat, .draw) %>%
+    mutate(prob_12 = sum(.value)) %>%
+    ggplot(aes({{covariate_display}}, prob_12)) +
+      background_grid(major = "y", color.major = "grey90") +
+      facet_rep_grid(treat~.) +
+    # geom_tile(
+    #   aes(x = x_val, 
+    #       y = .5, height = Inf, width = 1), 
+    #   alpha = alpha_val, 
+    #   fill = colorspace::lighten("forestgreen")) +
+    stat_pointinterval(.width = c(.5, .95)) +
+    # scale_fill_brewer(palette = "Greys") +
+    y_scale_percent +
+    # scale_x_continuous(expand = expansion(0)) +
+    ylab("probability of mechanical\nventilation or death\n(reference individuals)")
+    # theme(panel.border = element_rect(color = "black", size = 1),
+    #       axis.line = element_blank()) +
+    # geom_hline(yintercept = c(.25, .5, .75), color = "white") 
+  }
+}
+
+pi_plot_discrete(conditional_tables_baseline_niaid$pi_tbl, niaid_baseline_fct, 
+                 ref_level_display = "5 - hosp, no ox"
+                 )
+```
+
+```{r}
+rr_plot_discrete <- function(rr_draws, covariate_display, ref_level_display) {
+  x_val <- ref_level_display
+  alpha_val <- .01
+  
+  if (!is.null(ref_level_display)) {
+  rr_draws %>% 
+  ggplot(aes({{covariate_display}}, rr)) +
+  geom_tile(
+    aes(x = x_val, 
+        y = .5, height = Inf, width = 1), 
+    alpha = alpha_val, 
+    fill = colorspace::lighten("forestgreen")) + 
+  stat_pointinterval(.width = c(.5, .95)) +
+  scale_y_log10(breaks = scales::log_breaks()) +
+  # scale_fill_brewer(palette = "Greys") + 
+  geom_hline(yintercept = 1, color = "orange", size = .5) +
+  ylab("relative risk of mechanical\nventilation or death\n(reference individuals)")
+  # scale_x_continuous(expand = expansion(0))
+  } else {
+  rr_draws %>% 
+  ggplot(aes({{covariate_display}}, rr)) +
+  stat_pointinterval(.width = c(.5, .95)) +
+  scale_y_log10(breaks = scales::log_breaks()) +
+  # scale_fill_brewer(palette = "Greys") + 
+  geom_hline(yintercept = 1, color = "orange", size = .5) +
+  ylab("relative risk of mechanical\nventilation or death\n(reference individuals)")
+  }
+}
+
+rr_plot_discrete(conditional_tables_baseline_niaid$rr_tbl, niaid_baseline_fct, ref_level_display = NULL)
+```
+
+```{r}
+linpred_plot_discrete <- function(linpred_diff_draws, covariate_display, ref_level_display) {
+  x_val <- ref_level_display
+  alpha_val <- .01
+  
+  if(!is.null(ref_level_display)) {
+  linpred_diff_draws %>% 
+  ggplot(aes({{covariate_display}}, lin_pred_diff)) +
+  geom_tile(
+    aes(x = x_val, 
+        y = 0, height = Inf, width = 1), 
+    alpha = alpha_val, 
+    fill = colorspace::lighten("forestgreen")) + 
+  stat_pointinterval(.width = c(.5, .95)) +
+  # scale_fill_brewer(palette = "Greys") + 
+  geom_hline(yintercept = 0, color = "orange", size = .5) +
+  ylab("treatment effect\n(log proportional odds ratio) \n(reference individuals)")
+  # scale_x_continuous(expand = expansion(0))
+  } else {
+    linpred_diff_draws %>% 
+  ggplot(aes({{covariate_display}}, lin_pred_diff)) +
+  stat_pointinterval(.width = c(.5, .95)) +
+  # scale_fill_brewer(palette = "Greys") + 
+  geom_hline(yintercept = 0, color = "orange", size = .5) +
+  ylab("treatment effect\n(log proportional odds ratio) \n(reference individuals)")
+  # scale_x_continuous(expand = expansion(0))
+  }
+}
+
+linpred_plot_discrete(conditional_tables_baseline_niaid$linpred_diff_tbl, niaid_baseline_fct,
+                      "5 - hosp, no ox")
+```
+
+```{r fig.height=12, fig.width=6}
+x <- theme(axis.text.x = element_text(angle = 90, vjust = .5))
+y <- theme(axis.text.x = element_blank())
+
+niaid_plot_stacked <-
+  ((rr_plot_discrete(conditional_tables_baseline_niaid$rr_tbl, niaid_baseline_fct, ref_level_display = "5 - hosp, no ox") + y) /
+  (pi_plot_discrete(conditional_tables_baseline_niaid$pi_tbl, niaid_baseline_fct, 
+                 ref_level_display = "5 - hosp, no ox"
+                 ) + ylab("probability of mechanical\nventilation or death\n(reference individuals)") + y) /
+  (linpred_plot_discrete(conditional_tables_baseline_niaid$linpred_diff_tbl, niaid_baseline_fct,
+                      "5 - hosp, no ox") + x)) +
+  plot_annotation("Conditional effects - Baseline NCOSS")
+
+niaid_plot_stacked
+
+ggsave(file.path(conditional_effect_dir, "niaid_stacked.png"), niaid_plot_stacked, height = 12, width = 6)
+ggsave(file.path(conditional_effect_dir, "niaid_stacked.svg"), niaid_plot_stacked, height = 12, width = 6)
+```
+
+Finish compiling conditional effects:
+
+-   age (done)
+-   BMI (done)
+-   baseline NCOSS (done)
+
+
+
+### Sex
+
+We don't have a reference level here.
+
+```{r}
+conditional_tables_sex <-
+  tidyr::expand_grid(
+      reference_tbl %>% select(-sex_model),
+      sex_fct = c("male", "female")
+    ) %>%
+  mutate(sex_model = ifelse(sex_fct == "male", -.5, .5)) %>%
+  conditional_analysis_tables(brm_fit, sex_fct)
+  
+```
+
+```{r fig.height=12, fig.width=6}
+sex_plots_stacked <-
+  (rr_plot_discrete(conditional_tables_sex$rr_tbl, sex_fct, ref_level_display = NULL) /
+  (pi_plot_discrete(conditional_tables_sex$pi_tbl, sex_fct, ref_level_display = NULL
+                 ) + ylab("probability of mechanical\nventilation or death\n(reference individuals)")) /
+  linpred_plot_discrete(conditional_tables_sex$linpred_diff_tbl, sex_fct, ref_level_display = NULL)) +
+  plot_annotation(title = "Conditional effects - sex")
+
+sex_plots_stacked
+ggsave(file.path(conditional_effect_dir, "sex_stacked.png"), sex_plots_stacked, height = 12, width = 6)
+ggsave(file.path(conditional_effect_dir, "sex_stacked.svg"), sex_plots_stacked, height = 12, width = 6)
+```
+
+### Number of baseline comorbidities
+
+Treat this like a continuous covariate:
+
+```{r}
+conditional_tables_comorbidities <-
+  tidyr::expand_grid(
+      reference_tbl %>% select(-comorbidity_count),
+      comorbidity_count = seq(0, 9, .5)
+    ) %>%
+  conditional_analysis_tables(brm_fit, comorbidity_count)
+```
+
+```{r fig.height=12, fig.width=6}
+comorbidity_plots_stacked <-
+  ((rr_plot(conditional_tables_comorbidities$rr_tbl, comorbidity_count, ref_level_display = 0) + scale_y_log10() + scale_x_continuous(breaks = 0:9)) /
+  (pi_plot(conditional_tables_comorbidities$pi_tbl, comorbidity_count, ref_level_display = 0)
+    + scale_x_continuous(breaks = 0:9)) /
+  (lin_pred_plot(conditional_tables_comorbidities$linpred_diff_tbl, comorbidity_count, ref_level_display = 0)) + scale_x_continuous(breaks = 0:9)) +
+  plot_annotation("Conditional effects - Baseline comorbidity count")
+
+comorbidity_plots_stacked
+ggsave(file.path(conditional_effect_dir, "comorbidity_stacked.png"), comorbidity_plots_stacked, height = 12, width = 6)
+ggsave(file.path(conditional_effect_dir, "comorbidity_stacked.svg"), comorbidity_plots_stacked, height = 12, width = 6)
+```
+
+### Age
+
+```{r}
+conditional_tables_age <-
+  tidyr::expand_grid(
+      reference_tbl,
+      age = seq(18, 90, 3)
+    ) %>%
+    mutate(age_model = (age - 60)/10) %>%
+  conditional_analysis_tables(brm_fit, age)
+```
+
+```{r fig.height=12, fig.width=6}
+age_plots_stacked <-
+  ((rr_plot(conditional_tables_age$rr_tbl, age, ref_level_display = 60) + 
+      scale_y_log10()) /
+  (pi_plot(conditional_tables_age$pi_tbl, age, ref_level_display = 60)) /
+  (lin_pred_plot(conditional_tables_age$linpred_diff_tbl, age, ref_level_display = 60))) +
+  plot_annotation("Conditional effects - Age")
+
+age_plots_stacked
+ggsave(file.path(conditional_effect_dir, "age_stacked.png"), age_plots_stacked, height = 12, width = 6)
+ggsave(file.path(conditional_effect_dir, "age_stacked.svg"), age_plots_stacked, height = 12, width = 6)
+```
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+```{r}
+Sys.time()
+```
+

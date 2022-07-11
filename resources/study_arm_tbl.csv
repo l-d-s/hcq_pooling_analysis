@@ -1,0 +1,22 @@
+siteid	rand_grp	treat	azithro	CQ
+1-ORCHID	Placebo	no_HCQ	FALSE	FALSE
+1-ORCHID	Hydroxychloroquine	HCQ	FALSE	FALSE
+2-WashU	CQ + AZM	HCQ	TRUE	TRUE
+2-WashU	HCQ alone	HCQ	FALSE	FALSE
+2-WashU	HCQ + AZM	HCQ	TRUE	FALSE
+2-WashU	CQ alone	HCQ	FALSE	TRUE
+3-Duke	Azithromycin alone	no_HCQ	TRUE	FALSE
+3-Duke	Hydroxychloroquine alone	HCQ	FALSE	FALSE
+3-Duke	Hydroxychloroquine plus azithromycin	HCQ	TRUE	FALSE
+3-Duke	Control	no_HCQ	FALSE	FALSE
+4-NYU-TEACH	hydroxychloroquine	HCQ	FALSE	FALSE
+4-NYU-TEACH	placebo	no_HCQ	FALSE	FALSE
+4-NYU-TEACH	SCREEN FAIL	NA	NA	NA
+5-Bassett	placebo	no_HCQ	FALSE	FALSE
+6-IM-HAHPS	hydroxychloroquine arm	HCQ	FALSE	FALSE
+6-IM-HAHPS	azithromycin arm	no_HCQ	TRUE	FALSE
+7-UMC-New Orleans	Hydroxychloroquine + Azithromycin	HCQ	TRUE	FALSE
+7-UMC-New Orleans	Supportive care only	no_HCQ	FALSE	FALSE
+7-UMC-New Orleans	Hydroxychloroquine only	HCQ	FALSE	FALSE
+8-QMC-Honolulu	HCQ	HCQ	FALSE	FALSE
+8-QMC-Honolulu	UC	no_HCQ	FALSE	FALSE

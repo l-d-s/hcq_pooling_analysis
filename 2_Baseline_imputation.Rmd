@@ -1,0 +1,337 @@
+---
+title: "Baseline imputation"
+author: "Leon Di Stefano"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+      keep_md: false
+params:
+  outcome_min: 28
+  outcome_max: 35
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+require(here)
+require(mice)
+require(naniar)
+here::i_am(file.path("hcq_pooling_analysis", "2_Baseline_imputation.Rmd"))
+source(here("hcq_pooling_analysis", "common.R"))
+
+out_stub <- paste(params$outcome_min, params$outcome_max, sep = '-')
+output_dir <- here("hcq_pooling_analysis", "output", out_stub)
+```
+
+Key parameter: the number of imputations:
+
+```{r}
+n_imputations <- 20
+```
+
+### Load participant data
+
+Read patient data:
+
+```{r}
+patients <- read_rds(file.path(output_dir, "patients.rds"))
+```
+
+Select those patients who will participate in the imputation step:
+
+```{r}
+patients_for_imputation <-
+  patients %>%
+  filter(rand_grp != "SCREEN FAIL")
+
+nrow(patients); nrow(patients_for_imputation)
+```
+
+These are the patients who were successfully randomized/assigned to a treatment arm:
+
+```{r}
+sum(!is.na(patients$treat))
+```
+
+### Select/create variables to be used in the imputation model
+
+Things to do:
+
+-   Due to extensive missingness, we're not using the HIV or AIDS variables
+-   We also need to collapse smoking and vaping to never/ever binary versions
+-   We need to set to NA negative values of days since symptom onset.
+
+```{r}
+comorbidities_all <-
+  c("aids",
+    "crbr_vasc_dis",
+    "mi",
+    "cng_hrt_flr",
+    "dementia",
+    "copd",
+    "asthma",
+    "hypertension",
+    "hiv",
+    "tumor",
+    "liver_dis",
+    "diabetes",
+    "smoking",
+    "vaping"
+)
+
+# Could move this to common.R
+comorbidities_imputation <-
+  c(# "aids",
+    "crbr_vasc_dis",
+    "mi",
+    "cng_hrt_flr",
+    "dementia",
+    "copd",
+    "asthma",
+    "hypertension",
+    # "hiv",
+    "tumor",
+    "liver_dis",
+    "diabetes",
+    "smoking_binary", # "smoking",
+    "vaping_binary" # "vaping"
+)
+
+other_covariates_imputation <-
+  c(# In the outcome model(s)—excluding
+    # treatment and outcome
+    "sex_fct",
+    "age_5y",
+    "bmi",
+    "niaid_baseline_fct",
+    "sym_onst_days_bfr_enrdt",
+    # Others
+    "race_simplified_fct",
+    "ethnic_fct"
+  )
+```
+
+Create the table.
+
+Here we implement the choice to impute the following values:
+
+-   Implicit symptom onset _after_ enrollment.
+-   BMIs outside of 10 ≤ bmi ≤ 70 set to missing.
+
+```{r}
+imputation_tbl <-
+  patients_for_imputation %>%
+  # Create binary/logical comorbidities
+  mutate(
+    # as.numeric becase we want these to be 0,1 valued to match the others
+    hiv_binary     = as.numeric((hiv == 0)),
+    smoking_binary = as.numeric((smoking == 0)),
+    vaping_binary  = as.numeric((vaping == 0))
+    ) %>%
+  mutate_at(comorbidities_imputation, factor) %>%
+  # Remove negative symptom onset days before enrollment
+  mutate(
+    sym_onst_days_bfr_enrdt = 
+      ifelse(sym_onst_days_bfr_enrdt < 0, NA, 
+             sym_onst_days_bfr_enrdt),
+    # Remove extreme BMIs
+    bmi =
+      ifelse((bmi >= 10) & (bmi <= 70),
+	     bmi,
+	     NA)
+  ) %>%
+  select(
+    siteid, patient_id,
+    !!comorbidities_imputation,
+    !!other_covariates_imputation
+  )
+
+write_rds(imputation_tbl, file.path(output_dir, "imputation_tbl.rds"))
+```
+
+### Examine missingness patterns
+
+```{r}
+gg_miss_var(imputation_tbl %>% select(-siteid, patient_id))
+```
+
+```{r}
+mice::md.pattern(
+  imputation_tbl %>% select(-siteid, -patient_id),
+  rotate.names = TRUE)
+```
+
+By site:
+
+```{r}
+# TO DO
+
+# mice::md.pattern(
+#   imputation_tbl %>% select(-siteid, -patient_id),
+#   plot = FALSE) %>%
+#   as.data.frame() %>%
+#   rownames_to_column("count")
+```
+
+By treatment arm:
+
+Possibly by both?
+
+## Running MICE
+
+Need to set a specific seed:
+
+```{r message=FALSE}
+mice_fit <- mice::mice(
+  imputation_tbl %>% 
+    select(-siteid, -patient_id), 
+  seed = 20200524,
+  maxit = 20,
+  m = n_imputations # This strongly affects how long BRMS takes to fit
+  )
+```
+
+## Examining MICE fit
+
+Get a sense of the mixing:
+
+```{r}
+plot(mice_fit)
+```
+
+See which method was used for each variable:
+
+```{r}
+summary(mice_fit)
+```
+
+```{r}
+stripplot(mice_fit, jitter.data = TRUE)
+```
+
+```{r}
+densityplot(mice_fit)
+```
+
+```{r}
+bwplot(mice_fit)
+```
+
+It would be great to produce more diagnostics for the categorical variables (comorbidities).
+
+We might also compare the values for their sum.
+
+Note: this is done *ignoring* siteid (rather than including it as a predictor, or doing multilevel MI).
+
+### Write out the imputations
+
+```{r}
+write_rds(mice_fit, file.path(output_dir, "mice_fit_object.rds"))
+```
+
+## Adding response and model covariates
+
+
+Now to:
+
+-   pull out the list of imputed datasets
+-   join outcome variable, treatment assignment, and azithro, which weren't used in the imputation
+-   compute variables needed for the outcome model, in particular the comorbidity count
+
+```{r}
+
+# Could move this to common.R
+comorbidities_imputation <-
+  c(# "aids",
+    "crbr_vasc_dis",
+    "mi",
+    "cng_hrt_flr",
+    "dementia",
+    "copd",
+    "asthma",
+    "hypertension",
+    # "hiv",
+    "tumor",
+    "liver_dis",
+    "diabetes",
+    "smoking_binary", # "smoking",
+    "vaping_binary" # "vaping"
+)
+
+add_postbaseline_and_model_vars <-
+  function(d) {
+      comorbidity_count <-
+        rowSums((as.matrix(d[,comorbidities_imputation])) == 1 | (as.matrix(d[,comorbidities_imputation]) == TRUE))
+      
+      d %>% 
+        bind_cols(imputation_tbl %>% select(siteid, patient_id)) %>%
+        left_join(
+          patients %>% select(patient_id, treat, azithro, niaid_outcome),
+          by = "patient_id"
+        ) %>%
+        mutate(
+          sex_model = ifelse(sex_fct == "female", 1/2, -1/2),
+          age_model = (age_5y - 60)/10,
+          bmi_model = (bmi - 25)/5,
+          comorbidity_count = comorbidity_count,
+          niaid_baseline_numeric_model = 
+                # niaid_baseline_fct goes from 2:5, 
+                # converted to 1:4 by as.numeric
+            5 - (as.numeric(niaid_baseline_fct) + 1),
+          treat = relevel(factor(treat), ref = "no_HCQ")
+        ) %>%
+        as_tibble()
+    }
+
+mice_df_list <- 
+  mice::complete(mice_fit, action = "all", include = FALSE) %>%
+  map(
+    add_postbaseline_and_model_vars
+  )
+```
+We also need to a table of the raw data with baseline missingness intact:
+
+```{r}
+data_tbl <- add_postbaseline_and_model_vars(
+  imputation_tbl %>% select(-siteid, -patient_id))
+```
+
+Write this out:
+
+```{r}
+write_rds(data_tbl, file.path(output_dir, "data_tbl.rds"))
+```
+
+Also write out the MICE df list:
+
+```{r}
+write_rds(mice_df_list, file.path(output_dir, "mice_complete_df_list.rds"))
+```
+
+... and a `mids` object with the additional variables:
+
+```{r}
+mice_fit_withvars <- 
+  mice::complete(mice_fit, action = "long", include = TRUE) %>%
+  nest(-.imp) %>%
+  mutate(data = map(data, add_postbaseline_and_model_vars)) %>%
+  unnest(data) %>%
+  as.mids()
+
+write_rds(mice_fit_withvars, file.path(output_dir, "mice_fit_object_withvars.rds"))
+```
+
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+```{r}
+Sys.time()
+```
+

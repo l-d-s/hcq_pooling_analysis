@@ -1,0 +1,105 @@
+---
+author: "Leon Di Stefano"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    keep_md: false
+params:
+  fit_name: "main_fit"
+  outcome_min: 28
+  outcome_max: 35
+title: "`r paste0('Outcome model fit', params$outcome_min, params$outcome_max, params$fit_name, sep = '-')`"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+require(here)
+require(brms)
+require(tidybayes)
+require(mice)
+require(cmdstanr)
+
+here::i_am(file.path("hcq_pooling_analysis", "3a_Outcome_model_fit.Rmd"))
+
+source(here("hcq_pooling_analysis", "common.R"))
+
+set_cmdstan_path(here::here("hcq_pooling_analysis", ".cmdstan", "cmdstan-2.27.0"))
+
+out_stub         <- paste(params$outcome_min, params$outcome_max, sep = '-')
+output_dir       <- here("hcq_pooling_analysis", "output", out_stub)
+output_model_dir <- file.path(output_dir, params$fit_name)
+if(!dir.exists(output_model_dir)) {
+  dir.create(output_model_dir, recursive = TRUE)
+}
+```
+
+```{r}
+params
+```
+
+Read multiply-imputed data:
+
+```{r}
+mice_df_list <-
+  read_rds(here(output_dir, "mice_complete_df_list.rds"))
+
+patients <-
+  read_rds(here(output_dir, "patients.rds"))
+```
+
+Specify the primary model formula:
+
+```{r}
+sap_primary_model <-
+  brms::bf(
+    niaid_outcome ~
+        treat*(
+          sex_model +
+          splines::ns(age_model, 3) +
+          splines::ns(bmi_model, 3) +
+          splines::ns(comorbidity_count, 3) +
+          niaid_baseline_numeric_model
+        ) +
+        (1 + treat || siteid) +
+        (1 + treat || niaid_baseline_fct)
+  )
+```
+
+Have a look at the default priors:
+
+```{r}
+get_prior(sap_primary_model, data = mice_df_list[[1]])
+```
+
+Fit the primary outcome model:
+
+```{r message=FALSE}
+ncores <- parallel::detectCores() - 1
+brm_fit <-
+  brm_multiple(
+      formula = sap_primary_model,
+      family = cumulative,
+      prior = prior(student_t(3, 0, 10), class = sd), # Defaults may have changed—SAP has broader priors
+      data = mice_df_list,
+      cores = ncores,
+      control = list(adapt_delta = 0.999), # helps avoid divergent transitions 
+      iter = 3000,
+      thin = 3,
+      backend = 'cmdstanr',
+      seed = 20200524
+      # file_refit = "on_change"
+      )
+write_rds(brm_fit, file.path(output_model_dir, paste0(params$fit_name, ".rds")))
+```
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+```{r}
+Sys.time()
+```
+

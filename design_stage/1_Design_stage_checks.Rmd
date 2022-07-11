@@ -1,0 +1,1228 @@
+---
+title: "Final design-stage checks"
+author: "Leon Di Stefano"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+      self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+require(cowplot)
+require(lemon)
+theme_set(theme_cowplot())
+theme_update(
+  strip.background = element_blank(),
+  strip.text.y = element_text(angle = 0),
+  )
+
+require(ggbeeswarm)
+gg_scatter <- function(data, x_var, y_var) {
+  qplot({{x_var}}, {{y_var}}, 
+        data = data,
+        size = I(0.4)) +
+    cowplot::theme_cowplot()
+}
+
+gg_hist <- function(data, x_var, n_bins = 30) {
+  qplot({{x_var}}, bins = I(n_bins), 
+        data = data,
+        color = I("white")) +
+    scale_y_continuous(expand = expansion(0, .05)) +
+    cowplot::theme_cowplot()
+}
+
+require(naniar)
+require(table1)
+require(gt)
+require(haven)
+```
+
+## Load the data
+
+```{r}
+patient_raw <- read_dta(
+  "../data/2021-09-29_HCQ_Analysis_Datasets/HCQ_Analysis_Datasets/8Site_PatientData.dta")
+
+baseline_raw <- read_dta(
+  "../data/2021-09-29_HCQ_Analysis_Datasets/HCQ_Analysis_Datasets/8Sites_Outcome_BL.dta")
+
+# Check that all of the baseline values have "days post enrollment" == 0
+all(baseline_raw$days_post_enrollment == 0)
+```
+
+Need to deal with non-unique patient ids between sites:
+
+```{r}
+baseline_raw$patient_id %>% unique() %>% length()
+nrow(baseline_raw)
+baseline_raw %>% select(siteid, patient_id) %>% distinct() %>% nrow()
+```
+
+```{r}
+combined_all <- 
+  left_join(
+    patient_raw %>%
+      filter(passed_screen == 1) %>%
+      mutate(patient_id = str_c(siteid, patient_id, sep = "__")), 
+    baseline_raw %>%
+      mutate(# FIXED
+             # siteid = str_replace(siteid, "3-DUke", "3-Duke"),
+             patient_id = str_c(siteid, patient_id, sep = "__"))) %>%
+  select(-days_post_enrollment) %>%
+  rename(covid_scale_baseline = covid_scale)
+
+nrow(combined_all)
+```
+
+These are the final design-stage checks as described in our SAP.
+
+## Summary of missingness
+
+> We will also examine baseline covariates for missing data (See section 8).
+
+
+> We will assess the extent of missing baseline covariate data at the design stage. If the missingness
+is judged to be minor and sporadic, the missing values will be filled-in using multiple imputation.
+If the missingness is judged to be severe, the corresponding baseline variables will be excluded
+from the analysis.
+
+### Outcome missingness
+
+```{r}
+outcomes_uncensored <-
+  read_dta(
+    "../data/2021-09-29_HCQ_Analysis_Datasets/HCQ_Analysis_Datasets/8Sites_Outcome_Data.dta") %>%
+  mutate(
+         # FIXED:
+         # siteid = 
+         #   # Fix typos
+         #   str_replace(siteid, "3-DUke", "3-Duke") %>%
+         #   str_replace("^NYU$", "4-NYU-TEACH"),
+         patient_id = 
+           # FIXED
+           # Typos in patient IDs
+           # case_when(
+           #   (siteid == "4-NYU-TEACH") & (str_length(patient_id) == 2) ~ str_c("0", patient_id),
+           #   (siteid == "4-NYU-TEACH") & (str_length(patient_id) == 1) ~ str_c("00", patient_id),
+           #   (siteid == "8-QMC-Honolulu") & (patient_id == "POB11")    ~ "PB11",
+           #   TRUE                                                      ~ patient_id
+           # ) %>%
+           patient_id %>%
+           str_c(siteid, ., sep = "__"))
+
+# Any patient_ids IN combined all that are NOT in outcomes_unc
+combined_all %>% anti_join(outcomes_uncensored) %>% nrow()
+
+outcomes_uncensored <- filter(outcomes_uncensored, patient_id %in% combined_all$patient_id)
+
+patient_time_grid <-
+  expand_grid(
+    patient_id = unique(outcomes_uncensored$patient_id),
+    days_post_enrollment = 
+      min(outcomes_uncensored$days_post_enrollment):max(outcomes_uncensored$days_post_enrollment)
+  ) %>%
+  arrange(patient_id, days_post_enrollment) %>%
+  mutate(days_post_enrollment = as.numeric(days_post_enrollment)) %>%
+  left_join(outcomes_uncensored) %>%
+  group_by(patient_id) %>%
+  mutate(
+    died_before = cumsum(replace_na((covid_scale == 1), 0)) > 0,
+    has_outcome_value =
+      (!is.na(covid_scale)) | (died_before)) %>%
+  select(patient_id, days_post_enrollment, has_outcome_value) %>%
+  ungroup()
+
+rm(outcomes_uncensored)
+
+limits_tbl <-
+  cross_df(
+    list(start_day = 20:28, end_day = 30:40)
+  )
+
+n_patients_w_gt_one_measurement <- function(start_day, end_day) {
+  filter(patient_time_grid,
+         (days_post_enrollment >= start_day) & (days_post_enrollment <= end_day)) %>%
+    group_by(patient_id) %>%
+    summarise(any_measurements = any(has_outcome_value)) %>%
+    filter(any_measurements == 1) %>%
+    nrow()
+}
+
+(cases_by_range <-
+    limits_tbl %>%
+    mutate(n_patients_w_any_measurement = map2_dbl(start_day, end_day, n_patients_w_gt_one_measurement))) %>%
+  pivot_wider(names_from = start_day, values_from = n_patients_w_any_measurement) %>%
+  gt::gt(rowname_col = "end_day") %>%
+  gt::tab_spanner("cols: first day; rows: last day", columns = as.character(20:28)) %>%
+  gt::tab_header("# patients w/ outcome data")
+
+```
+
+```{r}
+n_patients <- length(unique(patient_time_grid$patient_id))
+
+cases_by_range %>%
+  mutate(prop_patients_w_any_measurement = n_patients_w_any_measurement/n_patients,
+         pct_patients_w_any_measurement = round(prop_patients_w_any_measurement * 100, 1)) %>%
+  select(start_day, end_day, pct_patients_w_any_measurement) %>%
+  pivot_wider(names_from = start_day, values_from = pct_patients_w_any_measurement) %>%
+  gt::gt(rowname_col = "end_day") %>%
+  gt::tab_spanner("cols: first day; rows: last day", columns = as.character(20:28)) %>%
+  gt::tab_header("% patients w/ outcome data")
+```
+
+```{r}
+cases_by_range %>%
+  mutate(prop_patients_w_any_measurement = n_patients_w_any_measurement/n_patients,
+         pct_patients_w_any_measurement = round(prop_patients_w_any_measurement * 100, 1)) %>%
+  select(start_day, end_day, pct_patients_w_any_measurement) %>%
+  pivot_wider(names_from = start_day, values_from = pct_patients_w_any_measurement) %>%
+  gt::gt(rowname_col = "end_day") %>%
+  gt::tab_spanner("cols: first day; rows: last day", columns = as.character(20:28)) %>%
+  gt::tab_header("% patients w/ outcome data")
+```
+
+An expanded version of the above:
+
+```{r, message=FALSE}
+expanded_tbl <-
+  cross_df(
+    list(start_day = 0:40, end_day = 0:40)
+  ) %>%
+    mutate(n_patients_w_any_measurement = map2_dbl(start_day, end_day, n_patients_w_gt_one_measurement)) %>%
+  mutate(prop_patients_w_any_measurement = n_patients_w_any_measurement/n_patients,
+         pct_patients_w_any_measurement = round(prop_patients_w_any_measurement * 100, 1)) %>%
+  select(start_day, end_day, pct_patients_w_any_measurement) %>%
+  mutate(start_day = str_c("d", start_day)) %>%
+  pivot_wider(names_from = start_day, values_from = pct_patients_w_any_measurement)
+
+expanded_tbl %>%
+  gt::gt(rowname_col = "end_day") %>%
+  gt::tab_spanner("cols: first day; rows: last day", columns = str_c("d", as.character(20:28))) %>%
+  gt::tab_header("% patients w/ outcome data") %>%
+  gt::data_color(
+    columns = str_c("d", as.character(0:40)),
+    colors = scales::col_numeric(
+      palette = c("lightgrey", "orange"),
+      domain  = c(0, 100)
+  ))
+```
+
+```{r}
+cases_by_range %>%
+  mutate(n_patients_wo_any_measurement = n_patients - n_patients_w_any_measurement) %>%
+  select(start_day, end_day, n_patients_wo_any_measurement) %>%
+  pivot_wider(names_from = start_day, values_from = n_patients_wo_any_measurement) %>%
+  gt::gt(rowname_col = "end_day") %>%
+  gt::tab_spanner("cols: first day; rows: last day", columns = as.character(20:28)) %>%
+  gt::tab_header("# patients missing outcome data")
+```
+
+```{r fig.height=3, fig.width=4.5}
+d28_dist_tbl <-
+  patient_time_grid %>% 
+  # add site information
+  left_join(combined_all %>% select(patient_id, siteid)) %>%
+  group_by(siteid, patient_id) %>% 
+  mutate(
+    d28_dist = ifelse(
+      has_outcome_value, 
+      abs(days_post_enrollment - 28),
+      Inf)) %>% 
+  summarise(d28_nearest_dist = min(d28_dist))
+
+gg_hist(d28_dist_tbl, d28_nearest_dist)
+```
+
+```{r fig.height=8, fig.width=5}
+gg_hist(d28_dist_tbl, d28_nearest_dist) +
+  facet_rep_grid(siteid~., scales = "free_y") +
+  scale_y_continuous(breaks = scales::pretty_breaks(2),
+                     expand = expansion(c(0, .1))) +
+  theme(
+    strip.background = element_blank(),
+    strip.text.y = element_text(angle = 0),
+  )
+```
+
+```{r}
+tibble(
+  dist_from_d28 = 0:30,
+  percent_w_measurement = 
+    round(100 * ecdf(d28_dist_tbl$d28_nearest_dist)(dist_from_d28), 1),
+  n_w_measurement = n_patients * ecdf(d28_dist_tbl$d28_nearest_dist)(dist_from_d28)
+) %>% gt::gt()
+```
+
+```{r fig.width=19, fig.height=6}
+patient_time_grid %>% 
+  left_join(
+    combined_all %>% select(patient_id, siteid)) %>% 
+  left_join(d28_dist_tbl) %>%
+  mutate(patient_id = factor(patient_id, levels = arrange(d28_dist_tbl, d28_nearest_dist)$patient_id, ordered = TRUE)) %>%
+  ggplot(aes(patient_id, days_post_enrollment)) + 
+  geom_tile(
+    aes(fill = has_outcome_value), color = "white") + 
+  facet_grid(.~siteid, scales = "free_x", space = "free_x") + 
+  scale_fill_manual(values = c("grey90", "orange")) + 
+  theme(
+    axis.ticks.x = element_blank(), 
+    axis.text.x = element_blank(), 
+    axis.line.x = element_blank()) + 
+  scale_y_continuous() +
+  geom_hline(yintercept = 28 - .5, color = "red") +
+  geom_hline(yintercept = 35 + .5, color = "red")
+```
+
+```{r fig.width=19, fig.height=6}
+patient_time_grid %>% 
+  left_join(
+    combined_all %>% select(patient_id, siteid)) %>% 
+  left_join(d28_dist_tbl) %>%
+  mutate(patient_id = factor(patient_id, levels = arrange(d28_dist_tbl, d28_nearest_dist)$patient_id, ordered = TRUE)) %>%
+  filter(siteid != "1-ORCHID") %>%
+  ggplot(aes(patient_id, days_post_enrollment)) + 
+  geom_tile(
+    aes(fill = has_outcome_value), color = "white") + 
+  facet_grid(.~siteid, scales = "free_x", space = "free_x") + 
+  scale_fill_manual(values = c("grey90", "orange")) + 
+  theme(
+    axis.ticks.x = element_blank(), 
+    axis.text.x = element_blank(), 
+    axis.line.x = element_blank()) + 
+  scale_y_continuous() +
+  geom_hline(yintercept = 28 - .5, color = "red") +
+  geom_hline(yintercept = 35 + .5, color = "red") +
+  geom_hline(yintercept = 30 + .5, color = "red")
+```
+
+Table of missingness for each site and overall under the d28-30 and d28-35 outcome definitions:
+
+```{r}
+patient_time_grid %>% 
+    left_join(
+        combined_all %>% select(patient_id, siteid)) %>% 
+  bind_rows(
+    patient_time_grid %>% 
+    left_join(
+        combined_all %>% select(patient_id, siteid)) %>%
+      mutate(siteid = "OVERALL")) %>%
+  group_by(siteid, patient_id) %>% 
+  summarise(
+    has_d2830 = any(days_post_enrollment >= 28 & days_post_enrollment <= 30 & has_outcome_value),
+    has_d2835 = any(days_post_enrollment >= 28 & days_post_enrollment <= 35 & has_outcome_value)) %>%
+  group_by(siteid) %>%
+  summarise(
+    n = n(),
+    n_d2830 = sum(has_d2830),
+    pct_d2830 = mean(100 * has_d2830) %>% round(1),
+    n_d2835 = sum(has_d2835),
+    pct_d2835 = mean(100 * has_d2835) %>% round(1)
+  )
+```
+
+Compute, for each patient, which is their closest measurement to day 28, where ties are resolved by taking the *later* day:
+
+```{r}
+best_time_tbl <-
+  patient_time_grid %>%
+    # add site information
+    left_join(combined_all %>% 
+                  select(patient_id, siteid)) %>%
+    group_by(siteid, patient_id) %>% 
+    filter(has_outcome_value) %>%
+    group_by(siteid, patient_id) %>%
+    mutate(
+        disp_from_28d = days_post_enrollment - 28
+    ) %>%
+    summarise(
+        min_disp_from_28d = disp_from_28d[
+            abs(disp_from_28d) == min(abs(disp_from_28d))] %>%
+            # Select the measurement *after* d28 if either side
+            max(),
+        closest_measurement_earlier =
+          28 + max(disp_from_28d[disp_from_28d <= 0]) %>%
+          (function(x) if (x == -Inf) {NA} else {x}),
+        closest_measurement_later   =
+          28 + min(disp_from_28d[disp_from_28d >= 0]) %>%
+          (function(x) if (x == Inf) {NA} else {x}),
+        closest_measurement = 28 + min_disp_from_28d
+    )
+```
+
+Best times outside d28-30:
+
+```{r}
+best_time_tbl %>%
+  filter(!(closest_measurement %in% 28:30)) %>% 
+  mutate(patient_id = str_replace(patient_id, ".*__", "")) %>% 
+  select(-min_disp_from_28d) %>% 
+  arrange(siteid, closest_measurement, patient_id) %>%
+  knitr::kable()
+```
+
+### Baseline missingness
+
+In tabular form:
+
+```{r}
+(missingness_table_overall <-
+  naniar::miss_var_summary(combined_all)) %>%
+  head() %>%
+  knitr::kable(digits = 0)
+```
+
+```{r}
+non_site_vars <- names(combined_all)[names(combined_all) != "siteid"]
+
+(missingness_table_by_site <-
+  combined_all %>%
+    nest(data = all_of(non_site_vars)) %>%
+    mutate(x = map(data, naniar::miss_var_summary)) %>%
+    select(-data) %>%
+    unnest(x)) %>%
+  head() %>%
+  knitr::kable(digits = 0)
+```
+
+Site-wise, as a wide table:
+
+```{r}
+var_categories <- read_tsv(
+  "variable_categories.tsv")
+
+missingness_table_by_site_wide <-
+  missingness_table_by_site %>%
+  select(-n_miss) %>%
+  mutate(pct_miss = round(pct_miss)) %>%
+  pivot_wider(names_from = siteid, values_from = pct_miss) %>%
+    left_join(var_categories)
+```
+
+Coloring this:
+
+```{r}
+require(gt)
+missingness_table_by_site_wide %>%
+  left_join(naniar::miss_var_summary(combined_all)) %>%
+  group_by(category) %>%
+  arrange(desc(pct_miss)) %>%
+  mutate(pct_miss = round(pct_miss)) %>%
+  gt::gt(rowname_col = "variable", groupname_col = "category") %>%
+  data_color(
+    columns = unique(combined_all$siteid),
+    colors = scales::col_numeric(
+      palette = c("lightgrey", "orange"),
+      domain = c(0, 100))
+    ) %>%
+  data_color(
+    columns = "pct_miss",
+    colors = scales::col_numeric(
+      palette = c("lightgrey", "cornflowerblue"),
+      domain = c(0, 100)
+  ))
+```
+
+## Imbalance in covariates
+
+> Before the outcome data are shared with the analysis team, we will examine the distributions of
+baseline covariates within and between trials. 
+
+> If there are substantial covariate imbalances (with respect to covariates not included in our
+model) between treated and control groups, either within a larger trial or overall, we will consider
+including that covariate in our outcome model.
+
+Therefore: need to check imbalance on all the (baseline) covariates (or at least **not just those to include in the model**,  **overall** and **within each trial**).
+
+MatchIt is probably an easy way to do this.
+
+First, to assign treatment groups.
+
+```{r}
+distinct(combined_all %>% select(siteid, rand_grp)) %>% knitr::kable()
+```
+
+```{r}
+(study_arm <-
+  read_tsv("../resources/study_arm_tbl.csv"))
+```
+
+```{r}
+combined <- left_join(
+  combined_all %>% filter(rand_grp != "SCREEN FAIL"), # Filter NYU screen fale
+  study_arm)
+
+combined %>% select(siteid, rand_grp, treat, azithro) %>% distinct()
+```
+
+How many in each arm, by study and overall?
+
+```{r}
+combined %>%
+  bind_rows(
+    combined %>% mutate(siteid = "[OVERALL]")
+  ) %>%
+  count(siteid, treat)
+```
+
+### Add factor versions of variables
+
+```{r}
+niaid_levels <- c(
+  "1 - death",
+  "2 - hosp, mech vent",
+  "3 - hosp, vent",
+  "4 - hosp, supp ox",
+  "5 - hosp, no ox",
+  "6 - no hosp, lim",
+  "7 - no hosp, no lim")
+
+combined_2 <-
+  combined %>%
+  mutate(
+    covid_scale_baseline_fct = 
+      factor(covid_scale_baseline, 
+        levels = 1:7,
+        labels = niaid_levels,
+        ordered = TRUE),
+    sex_fct = 
+      factor(
+        sex,
+        levels = 1:2,
+        labels = c("male", "female")) %>%
+      forcats::fct_explicit_na(),
+    race_fct =
+      factor(
+        race,
+        levels = 1:8,
+        labels = c(     
+          "1 = American Indian/Alaska Native",
+          "2 = Asian",
+          "3 = Black/African American",
+          "4 = Native Hawaiian/Pacific Islander",
+          "5 = White",
+          "6 = Multiple", 
+          "7 = Other/declined", 
+          "8 = Unknown/unavailable")),
+    ethnic_fct = factor(
+      ethnic,
+      levels = 0:2,
+      labels = c("not hispanic", "hispanic", "unknown")),
+    race_simplified_fct =
+      factor(race_simplified),
+    azithro_fct =
+      factor(
+        azithro, 
+        levels = c(F, T), 
+        labels = c("no azithro", "azithro"))
+    )
+
+write_rds(combined_2, "output/formatted_baseline_tbl.rds")
+```
+
+### Overall imbalance
+
+#### BMI
+
+```{r fig.height=5.5, fig.width=11}
+balance_plot_cts <- function(dataframe, covariate) { 
+  ggplot(
+  dataframe, aes(treat, {{covariate}})) + 
+    # Alternatively: beeswarm
+  ggbeeswarm::geom_quasirandom(size = .7, groupOnX = TRUE, aes(color = treat)) +
+  scale_color_manual(values = c("darkgreen", "darkorange")) +
+  facet_grid(~siteid, scales = "free_x", space = "free_x") +
+  geom_boxplot(color = "grey40",
+               fill = NA,
+               alpha = .4, 
+               outlier.shape = NA, 
+               coef = 0, size = .6) +
+  background_grid(major = "y", color.major = "white") +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5),
+        strip.text.x = element_text(size = 11),
+        panel.background = element_rect(fill = "grey95")) + 
+  geom_tile(alpha = 0) # deals with blank facets
+}
+
+balance_plot_cts(combined %>% 
+                   bind_rows(
+                     combined %>% mutate(siteid = "[OVERALL]")),
+                 bmi)
+```
+
+### Age
+
+```{r fig.height=5.5, fig.width=11}
+balance_plot_cts(
+  combined_2 %>% 
+    bind_rows(combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+    mutate(age_5y = age_5y + rnorm(n())),
+  age_5y) +
+  scale_y_continuous(
+    breaks = scales::breaks_width(10))
+```
+
+#### Baseline outcome scale
+
+```{r fig.height=5.5, fig.width=11}
+balance_plot_cts(
+  combined_2 %>% 
+    bind_rows(combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+    mutate(covid_scale_baseline = covid_scale_baseline + rnorm(n(), sd = .1)),
+  covid_scale_baseline) +
+  scale_y_continuous(
+    breaks = 2:5,
+    labels = (function(b) {niaid_levels[b]}))
+```
+
+UMC seems to have a slightly surprising imbalance?
+
+Check the association of this with age (for the Duke cases too), to see if the imputation is likely to be reasonable:
+
+```{r fig.height = 4, fig.width = 6}
+ggplot(combined, aes(age_5y, covid_scale_baseline)) +
+  geom_jitter(size = .6, width = 1.5, height = .25) +
+  geom_vline(aes(xintercept = age_5y), 
+             data = combined %>% filter(str_detect(siteid, "Duke")),
+             color = "grey80")
+```
+
+#### Symptom onset days before enrollment
+
+```{r fig.height=5.5, fig.width=11}
+balance_plot_cts(
+    combined %>% 
+        bind_rows(
+            combined %>% mutate(siteid = "[OVERALL]")) %>%
+      mutate(
+        sym_onst_days_bfr_enrdt =
+          sym_onst_days_bfr_enrdt + runif(n(), -.3, .3)),
+    sym_onst_days_bfr_enrdt)
+```
+
+-   New Orleans has an individual with a negative value here. 
+
+-   Duke is missing all of the values (n = 11).
+
+-   The NYU imbalance is perhaps a bit surprising? hard to tell.
+
+What do the marginal distributions of this look like?
+
+```{r}
+gg_hist(combined_2, sym_onst_days_bfr_enrdt) +
+  facet_rep_grid(treat ~.)
+```
+
+Is this associated with baseline COVID status?
+
+```{r fig.height=6, fig.width=5}
+combined_2 %>%
+  mutate(sym_onst_days_bfr_enrdt = sym_onst_days_bfr_enrdt + rnorm(n(), sd = .3)) %>%
+  ggplot(aes(covid_scale_baseline_fct, sym_onst_days_bfr_enrdt)) +
+  geom_beeswarm(size = .2) +
+  geom_boxplot(alpha = .1, fill = "orange", outlier.shape = NA, width = .4)
+```
+
+```{r}
+combined_2 %>%
+  mutate(
+    age_5y = age_5y + rnorm(n(), sd = 1),
+    sym_onst_days_bfr_enrdt = sym_onst_days_bfr_enrdt + rnorm(n(), sd = .2)) %>%
+  gg_scatter(age_5y, sym_onst_days_bfr_enrdt) +
+  geom_smooth(se = FALSE, color = "cornflowerblue", size = .6)
+```
+
+#### Date of admission
+
+```{r fig.height=5.5, fig.width=11}
+balance_plot_cts(
+    combined %>% 
+        bind_rows(
+            combined %>% mutate(siteid = "[OVERALL]")),
+    adm_days_before_enrdt)
+```
+
+#### Screening days before enrollment
+
+```{r fig.height=5.5, fig.width=11}
+balance_plot_cts(
+    combined %>% 
+        bind_rows(
+            combined %>% mutate(siteid = "[OVERALL]")),
+    scr_days_before_enrdt)
+```
+
+
+#### First dose days after enrollment
+
+```{r fig.height=5.5, fig.width=11}
+balance_plot_cts(
+    combined %>% 
+        bind_rows(
+            combined %>% mutate(siteid = "[OVERALL]")),
+    frstdose_days_after_enrdt)
+```
+
+#### Randomization days after enrollment
+
+```{r fig.height=5.5, fig.width=11}
+balance_plot_cts(
+    combined %>% 
+        bind_rows(
+            combined %>% mutate(siteid = "[OVERALL]")),
+    rand_days_after_enrdt)
+```
+
+### Discrete covariates
+
+#### Sex
+
+Try a plot first:
+
+```{r fig.height=9, fig.width=5}
+combined_2 %>% 
+    bind_rows(combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+  gg_hist(sex_fct) +
+  facet_rep_grid(siteid~treat, scale = "free_y") +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(2),
+    expand = expansion(c(0, .1))
+  ) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle = 0))
+```
+
+
+```{r}
+combined_2 %>%
+  bind_rows(
+    combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+  group_by(siteid) %>% 
+  count(treat, sex_fct) %>%
+  ungroup() %>%
+  group_by(siteid, treat) %>%
+  mutate(pct = round(100 * n/sum(n)), total = sum(n)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = c(sex_fct), 
+              values_from = c(pct))
+```
+
+Simplifying to percent female:
+
+```{r}
+combined_2 %>%
+  bind_rows(
+    combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+  group_by(siteid) %>% 
+  count(treat, sex_fct) %>%
+  group_by(siteid, treat) %>%
+  mutate(arm_total = sum(n),
+         female_pct = round(100*n/arm_total)) %>%
+  filter(sex_fct == "female") %>%
+  select(-sex_fct, -n) %>%
+  ungroup() %>%
+  group_by(siteid) %>%
+  mutate(site_total = sum(arm_total)) %>%
+  select(-arm_total) %>%
+  pivot_wider(names_from = treat, values_from = female_pct)
+  
+```
+
+#### Race and ethnicity
+
+```{r fig.height=9, fig.width=8}
+combined_2 %>%
+    bind_rows(combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+  gg_hist(race_simplified_fct) +
+  facet_rep_grid(siteid~treat, scale = "free_y") +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(2),
+    expand = expansion(c(0, .1))
+  ) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle = 0))
+```
+
+```{r fig.height=9, fig.width=5}
+combined_2 %>%
+    bind_rows(combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+  gg_hist(ethnic_fct) +
+  facet_rep_grid(siteid~treat, scale = "free_y") +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(2),
+    expand = expansion(c(0, .1))
+  ) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle = 0))
+```
+
+#### Baseline covid scale
+
+```{r fig.height=9, fig.width=7}
+combined_2 %>%
+    bind_rows(combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+  gg_hist(covid_scale_baseline_fct) +
+  facet_rep_grid(siteid~treat, scale = "free_y") +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(2),
+    expand = expansion(c(0, .1))
+  ) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle = 0))
+```
+
+#### Azithro
+
+```{r fig.height=9, fig.width=5}
+combined_2 %>%
+    bind_rows(combined_2 %>% mutate(siteid = "[OVERALL]")) %>%
+  gg_hist(factor(azithro)) +
+  facet_rep_grid(siteid~treat, scale = "free_y") +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(2),
+    expand = expansion(c(0, .1))
+  ) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_text(angle = 0))
+```
+
+Corresponding table:
+
+```{r}
+combined_2 %>%
+  bind_rows(
+    combined_2 %>%
+      mutate(siteid = "[OVERALL]")) %>%
+  count(
+    siteid, treat,
+    azithro_fct) %>%
+  group_by(siteid) %>%
+  mutate(site_total = sum(n),
+         prop = n/site_total) %>%
+  select(-n) %>%
+  pivot_wider(
+    names_from = c(treat, azithro_fct), 
+    values_from = prop) %>%
+  ungroup() %>%
+  gt(rowname_col = "siteid") %>%
+  data_color(
+    columns = c("HCQ_no azithro","HCQ_azithro","no_HCQ_no azithro","no_HCQ_azithro"),
+    colors = scales::col_numeric(
+      palette = c("grey95", "orange"),
+      domain = c(0, 1))
+    ) %>%
+  gt::fmt_percent(c("HCQ_no azithro","HCQ_azithro","no_HCQ_no azithro","no_HCQ_azithro"),
+                  decimals = 0)
+  
+```
+
+## Extreme values of covariates
+
+> If there are individuals with extreme values of
+baseline covariates, we will check their data with trial investigators, and potentially exclude them
+from the outcome analysis.
+
+[Covered above.]
+
+* * * * * * *
+* * * * * * *
+
+## Charlson -- exploration
+
+```{r}
+charlson_indicators <- 
+  var_categories$variable[
+    (var_categories$category == "charlson") &
+    (var_categories$variable != "charlson")
+  ]
+```
+
+```{r}
+charlson_matrix <-
+  combined_2[charlson_indicators] %>%
+  as.matrix()
+
+table(charlson_matrix, useNA = "always")
+```
+
+```{r}
+charlson_long <-
+  combined_2 %>%
+  select(siteid, patient_id, all_of(charlson_indicators)) %>%
+  pivot_longer(-c(siteid, patient_id))
+
+participant_charlson_1_count <-
+  charlson_long %>% group_by(siteid, patient_id) %>%
+  summarise(charlson_count = sum(value == 1, na.rm = TRUE))
+
+gg_hist(
+  participant_charlson_1_count,
+  factor(charlson_count))
+```
+
+```{r fig.height=10, fig.width=7}
+variable_charlson_1_count <-
+  charlson_long %>% 
+  group_by(name) %>%
+  summarise(charlson_var_count = sum(value == 1, na.rm = TRUE))
+  
+
+charlson_indicator_plot_df <-
+  charlson_long %>%
+  left_join(participant_charlson_1_count) %>%
+  left_join(variable_charlson_1_count) %>%
+  mutate(
+    value = forcats::fct_explicit_na(factor(value)),
+    name = factor(
+      name,
+      levels = (arrange(variable_charlson_1_count, desc(charlson_var_count)))$name,
+      ordered = TRUE),
+    patient_id = factor(
+      patient_id,
+      levels = (arrange(participant_charlson_1_count, charlson_count))$patient_id,
+      ordered = TRUE))
+  
+(charlson_indicator_plot <-
+  charlson_indicator_plot_df %>%
+  ggplot(aes(name, patient_id)) +
+  geom_tile(aes(fill = value)) +
+  scale_fill_manual(values = c("lightgrey", "darkgreen", "orange", "cornflowerblue", "tomato")) +
+  facet_grid(siteid~., scale = "free_y", space = "free_y") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = .5),
+        axis.line.y = element_blank()) +
+    ylab("patients sorted by #(comorbidity == 1)"))
+  
+```
+
+Notice that the weirdly coded Charlson variables are all within variables that are missing from ORCHID. So we arguably don't need to worry about them so much.
+
+Plotting number of conditions against outcome scale:
+
+```{r}
+combined_2 %>%
+  left_join(participant_charlson_1_count) %>%
+  mutate(
+    covid_scale_baseline = 
+      covid_scale_baseline + rnorm(n(), sd = .1)
+    ) %>%
+  ggplot(aes(factor(charlson_count), covid_scale_baseline)) +
+  ggbeeswarm::geom_quasirandom(size = .7, groupOnX = TRUE) +
+  scale_y_continuous(
+    breaks = 2:5,
+    labels = (function(b) {niaid_levels[b]}))
+```
+
+Trying a histogram of the same:
+
+```{r}
+combined_2 %>%
+  left_join(participant_charlson_1_count) %>%
+  mutate(
+    covid_scale_baseline = 
+      covid_scale_baseline + rnorm(n(), sd = .1)
+    ) %>%
+  ggplot(aes(factor(charlson_count))) +
+  geom_histogram(stat = "count") +
+  scale_y_continuous(expand = expansion(c(0, .1))) +
+  facet_rep_grid(covid_scale_baseline_fct~.,
+                 scale = "free_y")
+```
+
+Doesn't appear particularly predictive of baseline status (i.e., baseline status doesn't appear particularly helpful for a score). There's selection on baseline status, which probably makes a difference.
+
+### Alternative Charlson scores
+
+First, pull out the useable variables:
+
+```{r}
+charlson_indicators_nonmissing <-
+  charlson_indicators[!(charlson_indicators %in% c("aids", "vaping", "hiv", "smoking"))]
+```
+
+Table with different options for weights:
+
+```{r}
+charlson_weight_tbl <-
+  read_tsv("2021-06-14_charlson_weighting.tsv")
+```
+
+```{r}
+charlson_weight_tbl %>% 
+  select(
+    variable, missing, 
+    freilich_weight, adjusted_log_or_rescaled, log_or_rescaled) %>% 
+  pivot_longer(
+    cols = c(freilich_weight, adjusted_log_or_rescaled, log_or_rescaled)) %>% 
+  filter(!missing) %>% 
+  qplot(variable, value, color = name, data = .) + 
+  geom_line(aes(group = name)) +
+  coord_flip()
+```
+
+```{r}
+weights_tbl <-
+  combined_2 %>% 
+  select(patient_id, siteid, 
+         all_of(charlson_indicators_nonmissing)) %>% 
+  pivot_longer(cols = all_of(charlson_indicators_nonmissing)) %>% 
+  rename(variable = name) %>% 
+  left_join(charlson_weight_tbl) %>% 
+  group_by(siteid, patient_id) %>% 
+  summarise(
+    freilich_weight = sum(freilich_weight*value), 
+    adj_log_or_weight = sum(adjusted_log_or_rescaled*value, na.rm = TRUE), 
+    log_or_weight = sum(log_or_rescaled*value, na.rm = TRUE),
+    equal_weight = sum(value, na.rm = TRUE)) %>%
+  mutate(
+    equal_weight_jittered = equal_weight + rnorm(n(), sd = .06))
+```
+
+```{r}
+plot_grid(
+  gg_hist(weights_tbl, freilich_weight),
+  gg_hist(weights_tbl, adj_log_or_weight),
+  gg_hist(weights_tbl, log_or_weight),
+  gg_hist(weights_tbl, equal_weight),
+ncol = 1)
+```
+
+```{r fig.height=10, fig.width=5}
+plot_grid(
+  gg_scatter(weights_tbl, equal_weight_jittered, adj_log_or_weight) + theme(aspect.ratio = 1),
+  gg_scatter(weights_tbl, equal_weight_jittered, log_or_weight) + theme(aspect.ratio = 1),
+  gg_scatter(weights_tbl, equal_weight_jittered, freilich_weight) + theme(aspect.ratio = 1),
+ncol = 1)
+```
+
+```{r}
+# Pairs plot
+```
+
+## Considering degrees of freedom in a spline basis
+
+```{r fig.height=11, fig.width=10, warning=FALSE, message=FALSE}
+bmi_ns_1df <- splines::ns(combined_2$bmi, df = 1)
+plots_1df <-
+  list(
+    qplot(combined_2$bmi, bmi_ns_1df %*% rnorm(1)),
+    qplot(combined_2$bmi, bmi_ns_1df %*% rnorm(1)),
+    qplot(combined_2$bmi, bmi_ns_1df %*% rnorm(1)),
+    qplot(combined_2$bmi, bmi_ns_1df %*% rnorm(1)))
+
+bmi_ns_2df <- splines::ns(combined_2$bmi, df = 2)
+plots_2df <-
+  list(
+    qplot(combined_2$bmi, bmi_ns_2df %*% rnorm(2)),
+    qplot(combined_2$bmi, bmi_ns_2df %*% rnorm(2)),
+    qplot(combined_2$bmi, bmi_ns_2df %*% rnorm(2)),
+    qplot(combined_2$bmi, bmi_ns_2df %*% rnorm(2)))
+
+bmi_ns_3df <- splines::ns(combined_2$bmi, df = 3)
+plots_3df <-
+  list(
+    qplot(combined_2$bmi, bmi_ns_3df %*% rnorm(3)),
+    qplot(combined_2$bmi, bmi_ns_3df %*% rnorm(3)),
+    qplot(combined_2$bmi, bmi_ns_3df %*% rnorm(3)),
+    qplot(combined_2$bmi, bmi_ns_3df %*% rnorm(3)))
+
+bmi_ns_4df <- splines::ns(combined_2$bmi, df = 4)
+plots_4df <-
+  list(
+    qplot(combined_2$bmi, bmi_ns_4df %*% rnorm(4)),
+    qplot(combined_2$bmi, bmi_ns_4df %*% rnorm(4)),
+    qplot(combined_2$bmi, bmi_ns_4df %*% rnorm(4)),
+    qplot(combined_2$bmi, bmi_ns_4df %*% rnorm(4)))
+
+bmi_ns_5df <- splines::ns(combined_2$bmi, df = 5)
+plots_5df <-
+  list(
+    qplot(combined_2$bmi, bmi_ns_5df %*% rnorm(5)),
+    qplot(combined_2$bmi, bmi_ns_5df %*% rnorm(5)),
+    qplot(combined_2$bmi, bmi_ns_5df %*% rnorm(5)),
+    qplot(combined_2$bmi, bmi_ns_5df %*% rnorm(5)))
+
+plot_grid(
+  plotlist = c(plots_1df, plots_2df, plots_3df,
+               plots_4df, plots_5df), 
+  nrow = 5)
+```
+
+## Scatterplot of variables to use in imputation model
+
+```{r fig.height=7, fig.width=7}
+combined_2 %>% 
+  select(
+    covid_scale_baseline,
+    sex,
+    age_5y,
+    bmi,
+    sym_onst_days_bfr_enrdt) %>%
+  mutate(
+    covid_scale_baseline = covid_scale_baseline + rnorm(n(), sd = .15),
+    sex = sex + runif(n(), -.1, .1),
+    age_5y = age_5y + rnorm(n(), sd = 1),
+    sym_onst_days_bfr_enrdt = sym_onst_days_bfr_enrdt + rnorm(n(), sd = .2)
+  ) %>%
+  pairs(panel = panel.smooth, pch = ".")
+```
+
+## Tables for Risk of Bias Assessment
+
+### Baseline covariates by treatment group, and by treatment x study
+
+```{r}
+require(table1)
+```
+
+Main baseline variables:
+
+```{r}
+table1(~ sex_fct + 
+         race_fct + ethnic_fct + 
+         age_5y +
+         bmi +
+         covid_scale_baseline_fct +
+         sym_onst_days_bfr_enrdt
+       | siteid * treat, 
+       data = combined_2 %>%
+         mutate(
+           covid_scale_baseline_fct = 
+             factor(covid_scale_baseline_fct, 
+                    levels = niaid_levels[2:5])
+           ))
+```
+
+### Corticosteroids and azithromycin
+```{r}
+count(combined_2, azithro, on_azithromycin, on_corticosteroids)
+```
+
+```{r}
+table1(~ on_corticosteroids + on_azithromycin + azithro_arm
+       | siteid * treat, 
+       data = combined_2 %>%
+         mutate_at(
+           vars(on_corticosteroids, on_azithromycin),
+           as.logical
+           ) %>%
+         rename(azithro_arm = azithro))
+```
+
+Version of azithro table emphasizing compliance or not:
+
+```{r}
+table1(~ azithro_use
+       | siteid * treat, 
+       data = combined_2 %>%
+         mutate(
+           azithro_use = case_when(
+             azithro    & on_azithromycin    ~ "assigned, took",
+             (!azithro) & on_azithromycin    ~ "not assigned, took",
+             (!azithro) & (!on_azithromycin) ~ "not assigned, did not take",
+             azithro    & (!on_azithromycin) ~ "assigned, did not take"
+           )
+         ))
+```
+
+### Charlson variables by treatment group, and by treatment x study
+
+
+```{r}
+charlson_vars_bar_score <-
+  var_categories %>%
+  filter(category == "charlson",
+         variable != "charlson") %>%
+  pull(variable)
+
+table1(~ aids + crbr_vasc_dis + mi + 
+         cng_hrt_flr + dementia + copd + 
+         asthma + hypertension + hiv + 
+         tumor + liver_dis + diabetes + 
+         smoking + vaping + charlson
+       | siteid * treat, 
+       data = combined_2 %>%
+         mutate_at(
+           .vars = charlson_vars_bar_score, 
+           .funs = as.logical))
+```
+
+### Outcome missingness by treatment group and treatment x study
+
+Using the (28d-35d) definition:
+
+```{r}
+left_join(combined_2, patient_time_grid) %>%
+  group_by(treat, siteid, patient_id) %>%
+  filter((days_post_enrollment >= 28) &
+           (days_post_enrollment <= 35)) %>%
+  summarise(has_outcome_value = any(has_outcome_value)) %>%
+  table1(~ has_outcome_value
+       | siteid * treat, 
+       data = .)
+```
+
+### First and last dose information
+
+```{r fig.height=4, fig.width=16}
+combined_2 %>%
+  group_by(siteid, treat) %>%
+  arrange(lstdose_days_after_enrdt) %>%
+  mutate(plot_order = 1:n()) %>%
+  ggplot(aes(plot_order)) +
+  facet_grid(treat~siteid, scales = "free_x", space = "free_x") +
+  geom_linerange(aes(
+    x = plot_order, 
+    ymin = frstdose_days_after_enrdt, 
+    ymax = lstdose_days_after_enrdt),
+    color = "grey70") +
+  geom_point(aes(x = plot_order, y = frstdose_days_after_enrdt), size = .3) +
+  geom_point(aes(x = plot_order, y = lstdose_days_after_enrdt), size = .3) +
+  geom_point(aes(x = plot_order, y = died_days_after_enrdt), size = .6, color = "red") +
+  xlab("") +
+  theme(axis.text.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.background = element_rect(fill = "grey95"),
+        strip.text = element_text(angle = 90, vjust = .5)) +
+  background_grid(major = "y", color.major = "white")
+```
+
+There appear to be the following kinds of anomaly:
+
+Given the differences in the control arms, we should really care about these *among the HCQ patients*:
+
+```{r}
+table1(~ frstdose_days_after_enrdt + 
+         lstdose_days_after_enrdt + 
+         dose_duration
+       | siteid * treat, 
+       data = 
+         combined_2 %>% 
+         mutate(dose_duration = lstdose_days_after_enrdt - frstdose_days_after_enrdt))
+```
+
+Inconsistent individuals:
+
+```{r}
+combined_2 %>%
+  mutate(
+    dose_duration = lstdose_days_after_enrdt - frstdose_days_after_enrdt + 1,
+    dose_before_enrollment = frstdose_days_after_enrdt < 0,
+    negative_dose_duration = dose_duration < 0) %>%
+  filter(dose_before_enrollment | negative_dose_duration) %>%
+  select(patient_id, rand_grp, frstdose_days_after_enrdt, lstdose_days_after_enrdt) %>%
+  knitr::kable()
+  
+```
+
+## Things to discuss
+* * * * *
+
+

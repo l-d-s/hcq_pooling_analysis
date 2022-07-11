@@ -1,0 +1,321 @@
+---
+title: "8 Misc manuscript numbers"
+author: "Leon Di Stefano"
+date: "8/20/2021"
+output: html_document
+params:
+  fit_name: "main_fit"
+  outcome_min: 28
+  outcome_max: 35
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyverse)
+require(here)
+here::i_am(file.path("hcq_pooling_analysis", "7_Misc_manuscript_numbers.Rmd"))
+
+require(meta)
+```
+
+```{r}
+out_stub         <- paste(params$outcome_min, params$outcome_max, sep = '-')
+output_dir       <- here("hcq_pooling_analysis", "output", out_stub)
+output_model_dir <- file.path(output_dir, params$fit_name)
+
+data_tbl <- read_rds(file.path(output_dir, "data_tbl.rds"))
+patients <- read_rds(file.path(output_dir, "patients.rds")) %>% filter(passed_screen == 1)
+study_arms <- read_tsv("resources/study_arm_tbl.csv")
+```
+
+Number of patients:
+
+```{r}
+nrow(data_tbl)
+```
+
+Treat vs control
+
+```{r}
+count(data_tbl, treat)
+```
+
+Mortality:
+
+```{r}
+data_tbl %>% count(treat, as.numeric(niaid_outcome) == 1) %>% group_by(treat) %>% mutate(pct = 100 * n/sum(n))
+```
+
+Median onset days before enrdt:
+
+```{r}
+summary(data_tbl$sym_onst_days_bfr_enrdt)
+```
+
+```{r}
+hist(data_tbl$sym_onst_days_bfr_enrdt, 40)
+```
+
+Dose information: median (IQR) length of dosing among the HCQ patients (controls not comparable):
+
+```{r}
+patients %>% 
+    mutate(
+      dose_duration = 
+        lstdose_days_after_enrdt - frstdose_days_after_enrdt) %>% 
+  group_by(treat) %>% 
+  summarise(
+    val = quantile(
+      dose_duration, 
+      c(.25, .5, .75), 
+      na.rm = TRUE), 
+    quantile = names(val))
+```
+
+Percent beginning dosing on day 0:
+
+```{r}
+patients %>%
+  bind_rows(patients %>% mutate(treat = "OVERALL")) %>%
+  group_by(treat) %>%
+  summarise(mean(frstdose_days_after_enrdt == 0, na.rm = TRUE),
+            sum(frstdose_days_after_enrdt == 0, na.rm = TRUE),
+            sum(is.na(frstdose_days_after_enrdt)))
+```
+
+```{r}
+sum(is.na(patients$frstdose_days_after_enrdt))
+```
+
+HCQ vs. CQ:
+
+```{r}
+study_arms
+```
+
+```{r}
+count(patients, treat)
+```
+
+```{r}
+count(patients, treat, CQ)
+```
+
+Corticosteroids:
+
+
+Missingness at for different outcome definitions (taking into account mortality inconsistencies not known at the design stage):
+
+```{r}
+x35 <- read_rds("output/28-35/data_tbl.rds")
+x30 <- read_rds("output/28-30/data_tbl.rds")
+
+round(100 * mean(!is.na(x35$niaid_outcome)), 2)
+round(100 * mean(!is.na(x30$niaid_outcome)), 2)
+```
+
+Comparing ORCHID-only versus full fit CI widths:
+
+```{r}
+orchid_only_subgroups <- read_tsv("output/28-35/main_fit_Vanderbilt_only/subgroup_effects/subgroup_analysis_table.tsv")
+full_model_subgroups  <- read_tsv("output/28-35/main_fit/subgroup_effects/subgroup_analysis_table.tsv")
+
+orchid_vs_full_CI_widths <- 
+  bind_cols(
+    full_model_subgroups %>% select(analysis, subgroups, level),
+    tibble(
+  orchid_CI_width = orchid_only_subgroups %>% transmute(or_CI_width = logor_95_upper - logor_95_lower) %>% pull(or_CI_width),
+  full_CI_width   = full_model_subgroups  %>% transmute(or_CI_width = logor_95_upper - logor_95_lower) %>% pull(or_CI_width)
+)) %>% filter(analysis == "superpop_posterior")
+
+orchid_vs_full_CI_widths
+```
+
+```{r}
+orchid_vs_full_CI_widths %>%
+  qplot(orchid_CI_width, full_CI_width, data = .) +
+  geom_abline()
+```
+
+```{r}
+orchid_vs_full_CI_widths %>%
+  filter(orchid_CI_width < full_CI_width)
+```
+
+Adjusted OR from additive model:
+
+```{r}
+additive_fit <- read_rds("output/28-35/main_fit_no_interactions/main_fit_no_interactions.rds")
+```
+
+```{r}
+additive_summary <- summary(additive_fit)
+
+additive_summary$fixed["treatHCQ",c("Estimate", "l-95% CI", "u-95% CI")] %>%
+  exp() %>%
+  round(2)
+```
+
+Pre-analysis tweaks of values (BMI and possibly—though not in fact—symptoms onset days before enrollment):
+
+```{r}
+patients %>% count(sym_onst_days_bfr_enrdt < 0)
+```
+
+```{r}
+patients %>% count(bmi < 10 | bmi > 70)
+```
+
+```{r}
+data_tbl %>% count(bmi < 10 | bmi > 70)
+```
+
+# Begg and Egger tests
+
+From plugin subgroup analysis by site:
+
+```{r}
+subgroup_analysis_tbl <- 
+  read_tsv(
+    file.path(
+      output_model_dir,
+      "subgroup_effects/subgroup_analysis_table.tsv"))
+
+(site_plugin_tbl <-
+  subgroup_analysis_tbl %>%
+  filter(subgroups == "site", analysis == "maximum likelihood") %>%
+  select(level, logor_hat, logor_se))
+```
+
+```{r}
+(site_plugin_meta_object <- 
+  meta::metagen(
+    TE = site_plugin_tbl$logor_hat, 
+    seTE = site_plugin_tbl$logor_se))
+```
+
+Begg test:
+
+```{r}
+metabias(
+  site_plugin_meta_object,
+  plotit = TRUE,
+  k.min = 6,
+  method.bias = "rank" # Begg
+)
+```
+
+Egger test:
+
+```{r}
+metabias(
+  site_plugin_meta_object,
+  plotit = TRUE,
+  k.min = 6,
+  method.bias = "linreg" # Egger
+)
+```
+
+### Exploratory analysis of days from symptom onset to enrollment
+
+```{r}
+require(patchwork)
+require(cowplot)
+theme_set(theme_cowplot())
+
+sym_onset_subgroup_tbl <- 
+  read_tsv("output/28-35/main_fit/subgroup_effects/subgroup_analysis_table.tsv") %>%
+  filter(
+    subgroups == "sym_onset_fct",
+    analysis == "maximum likelihood",
+    !is.na(level)) %>%
+  mutate(
+    level = 
+      factor(level, 
+             labels = str_c((level), "\n(n=", n, ")")) %>%
+      fct_rev())
+```
+
+ORs:
+
+```{r}
+(or_plot <- sym_onset_subgroup_tbl %>%
+  ggplot(aes(level, exp(logor_hat))) +
+  geom_hline(yintercept = 1, lty = "dotted") +
+  geom_pointrange(aes(ymin = exp(logor_95_lower), ymax = exp(logor_95_upper))) +
+  ylab("Proportional odds ratio") +
+  scale_y_log10(labels = function(s) str_c(s, "×")))
+```
+
+RDs:
+
+```{r}
+(surv_rd_plot <- sym_onset_subgroup_tbl %>%
+  ggplot(aes(level, rd_surv)) +
+  geom_hline(yintercept = 0, lty = "dotted") +
+  geom_pointrange(aes(ymin = rd_surv_95_lower, ymax = rd_surv_95_upper)) +
+  ylab("Risk difference for mortality") +
+  scale_y_continuous(labels = function(x) str_c(100*x, "%")))
+```
+
+
+
+```{r}
+(combined_risk_plot <-
+  sym_onset_subgroup_tbl %>%
+  ggplot(aes(level)) +
+  geom_hline(yintercept = 0, lty = "dotted") +
+  geom_pointrange(aes(
+    y = 1 - est_p_surv_no_HCQ, 
+    ymin = 1 - est_p_surv_no_HCQ_95_upper, # NOTA BENE 
+    ymax = 1 - est_p_surv_no_HCQ_95_lower),
+    position = position_nudge(x = -.12),
+    color = "grey40",
+    fill = "white",
+    shape = 22) + # Square
+  geom_pointrange(aes(
+    y = 1 - est_p_surv_HCQ, 
+    ymin = 1 - est_p_surv_HCQ_95_upper, 
+    ymax = 1 - est_p_surv_HCQ_95_lower),
+    position = position_nudge(x = +.12),
+    color = "grey40",
+    fill = "grey40",
+    shape = 22) + # Triangle
+  ylab("Mortality") +
+  scale_y_continuous(
+    labels = (function(x) str_c(100*x, "%")),
+    limits = c(0, NA),
+    expand = expansion(c(0, .5))
+   )
+)
+```
+
+```{r fig.width=10, fig.height=3.5}
+theme_update(axis.title.y = element_text(angle = 0, vjust = .5))
+(combined_plot <-
+  (or_plot + 
+   coord_flip() +
+   xlab("Days between\nsymptom onset\nand enrollment")
+ ) + 
+  (combined_risk_plot +
+     coord_flip() + 
+     theme(axis.text.y = element_blank(), axis.title.y = element_blank()) +
+     cowplot::background_grid("x", "none", colour.major = "grey90")
+   ) +
+  (surv_rd_plot + 
+     coord_flip() + 
+     theme(axis.text.y = element_blank(), axis.title.y = element_blank())
+   ) +
+  patchwork::plot_layout(nrow = 1))
+
+ggsave("output/28-35/sym_onset_sensitivity_analysis.svg")
+```
+
+```{r}
+sessionInfo()
+```
+
+```{r}
+Sys.time()
+```
+

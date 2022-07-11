@@ -1,0 +1,15 @@
+variable_name	variable	missing	freilich_weight	variable_name_rosenthal	or	adjusted_or	log_or	adjusted_log_or	log_or_rescaled	adjusted_log_or_rescaled
+AIDS (do not include HIV-positive without AIDS criteria)	aids	1	3	AIDS	0.9	0.68	-0.045757490560675	-0.167491087293764		
+Cerebrovascular disease	crbr_vasc_dis	0	1	Cerebrovascular disease	2.11	1.39	0.324282455297693	0.143014800254095	2.84599714447962	4.27883695804127
+A prior myocardial infarction	mi	0	3	Myocardial infarction	2.89	1.47	0.460897842756548	0.167317334748176	4.04497351908167	5.00594060453515
+Congestive heart failure	cng_hrt_flr	0	3	Congesetive heart failure	2.47	1.37	0.392696953259666	0.136720567156407	3.44642267678922	4.09052080367777
+Dementia	dementia	0	1	Dementia	2.83	1.21	0.45178643552429	0.08278537031645	3.96500915918008	2.47684226713463
+COPD	copd	0	3	COPD	1.3	1.3	0.113943352306837	0.113943352306837	1	3.40905295191397
+Asthma	asthma	0	3							
+History of hypertension	hypertension	0	3	Hypertension	2.38	1.08	0.376576957056512	0.03342375548695	3.30494890164748	1
+HIV positive (without AIDS)	hiv	1	1							
+Solid tumor	tumor	0	2	Metastatic solid tumor	1.94	1.57	0.287801729930226	0.195899652409234	2.52583168832182	5.86109039978235
+Liver disease	liver_dis	0	2							
+Diabetes mellitus	diabetes	0	3	Diabetes	1.59	1.2	0.201397124320451	0.079181246047625	1.76751973891475	2.369011048999
+Cigarette or tobacco smoking	smoking	1	1							
+Vaping	vaping	1	1							

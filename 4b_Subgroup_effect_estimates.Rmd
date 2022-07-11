@@ -1,0 +1,1102 @@
+---
+author: "Leon Di Stefano"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+      toc: true
+      keep_md: false
+params:
+  fit_name: "main_fit"
+  outcome_min: 28
+  outcome_max: 35
+title: "`r paste0('Subgroup effects - tables and plots -', params$outcome_min, params$outcome_max, params$fit_name, sep = '-')`"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+require(here)
+here::i_am(file.path("hcq_pooling_analysis", "4b_Subgroup_effect_estimates.Rmd"))
+source(here("hcq_pooling_analysis", "common.R"))
+
+require(brms)
+require(tidybayes)
+
+require(mice)
+
+require(bayesplot)
+bayesplot_theme_set(theme_cowplot())
+bayesplot_theme_update(
+  strip.background = element_blank(),
+  strip.text.y = element_text(angle = 0),
+  strip.text = element_text(face = "bold")
+)
+
+require(MASS, exclude = "select") # clashes with dplyr
+
+out_stub         <- paste(params$outcome_min, params$outcome_max, sep = '-')
+output_dir       <- here("hcq_pooling_analysis", "output", out_stub)
+output_model_dir <- file.path(output_dir, params$fit_name)
+fit_file         <- file.path(output_model_dir, paste0(params$fit_name, ".rds"))
+
+subgroup_dir <- file.path(output_model_dir, "subgroup_effects")
+```
+
+## Loading model and data
+
+```{r}
+brm_fit <- read_rds(fit_file)
+data_tbl <- read_rds(file.path(output_dir, "data_tbl.rds"))
+data_tbl_annotated <- read_rds(file.path(output_model_dir, "data_tbl_annotated.rds"))
+```
+
+Load posterior fitted/predictive tables:
+
+```{r}
+data_tbl_po_pp              <- read_rds(file.path(subgroup_dir,
+                                                  paste0(params$fit_name, "_data_tbl_po_pp.rds")))
+data_tbl_po_pp_matched_pair <- read_rds(file.path(subgroup_dir,
+                                                  paste0(params$fit_name, "_data_tbl_po_pp_matched_pair.rds")))
+data_tbl_po_fitted          <- read_rds(file.path(subgroup_dir,
+                                                  paste0(params$fit_name, "_data_tbl_po_fitted_.rds")))
+```
+
+## Functions for the different estimands
+
+We want a function to compute the "proportional odds estimand" using `polr`. If there are only two levels' worth of responses in the dataset, then use a logistic regression.
+
+```{r}
+polr_tidy_fit <- function(treat, outcome, ...) {
+  polr(outcome ~ treat,
+       Hess = TRUE,
+       ...
+       ) %>%
+    broom::tidy(conf.int = TRUE, conf.level = .95) %>%
+    filter(term == "treatHCQ") %>% 
+    transmute(
+      logor_hat      = estimate, 
+      logor_95_lower = conf.low, 
+      logor_95_upper = conf.high, 
+      logor_se       = std.error)
+}
+
+polr_est_only <- function(treat, outcome, ...) {
+  logor_hat <-
+    polr(outcome ~ treat,
+         Hess = TRUE,
+         ...
+         ) %>%
+    coef()
+  
+  return(logor_hat)
+}
+
+logit_tidy_fit <- function(treat, outcome, ...) {
+  glm(outcome ~ treat,
+      family = binomial(),
+      ...
+      ) %>%
+    broom::tidy(conf.int = TRUE, conf.level = .95) %>%
+    filter(term == "treatHCQ") %>% 
+    transmute(
+      logor_hat      = estimate, 
+      logor_95_lower = conf.low, 
+      logor_95_upper = conf.high, 
+      logor_se       = std.error)
+}
+
+logit_est_only <- function(treat, outcome, ...) {
+  logor_hat <-
+    (glm(outcome ~ treat,
+      family = binomial(),
+      ...
+      ) %>%
+    coef())[2]
+  
+  return(logor_hat)
+}
+
+rd_plugin <- function(treat, outcome) {
+  # Exclude from the numerator and denominator those with missing outcomes
+  treat   <- treat[!is.na(outcome)]
+  outcome <- outcome[!is.na(outcome)]
+  
+  pt_obj <- prop.test(
+
+    c(sum(treat & outcome), sum((!treat) & outcome)),
+    c(sum(treat)          , sum((!treat))          ), 
+    conf.level = .95)
+  
+  est <- diff(rev(pt_obj$estimate))
+  names(est) <- "diff"
+  
+  return(c(est = est,
+           lower_95 = pt_obj$conf.int[1],
+           upper_95 = pt_obj$conf.int[2]))
+}
+
+prop_plugin <- function(treat_grp, outcome) {
+  treat_grp <- treat_grp[!is.na(outcome)]
+  outcome   <- outcome[!is.na(outcome)]
+  
+    pt_obj <- prop.test(
+      # Exclude from the numerator and denominator those with missing outcomes
+      sum(treat_grp & outcome),
+      sum(treat_grp),
+      conf.level = .95)
+  
+  est <- pt_obj$estimate
+  names(est) <- "prop"
+  
+  return(c(est = est,
+           lower_95 = pt_obj$conf.int[1],
+           upper_95 = pt_obj$conf.int[2]))
+}
+```
+
+There's no need to pool over multiple imptuations here, since we're not making use of any of the baseline covariates.
+
+Check the correlation between the mean of cumulative log odds ratios and the `polr` estimand:
+
+```{r}
+# Find somewhere for this ...
+
+# qplot(mean_logor, logor_hat,
+#       data = polr_by_age_posterior_superpop,
+#       size = I(.3)) +
+#   geom_abline(color = "orange") +
+#   coord_fixed() +
+#   ylab("polr estimand") +
+#   geom_label(x = 1, y = -1, label = 
+#                str_c("corr = ",
+#                  cor(polr_by_age_posterior_superpop$mean_logor,
+#                      polr_by_age_posterior_superpop$logor_hat) %>%
+#                    round(2)))
+```
+
+## Functions to compute subgroup effects from tables of posterior samples
+
+Create functions to perform the standardized analysis for any given factor:
+
+### Finite-sample, matched estimand (not included)
+
+```{r}
+grouped_matched_posterior <- 
+  function(paired_pp_draws, grouping_factor) {
+    paired_pp_draws %>%
+    mutate(
+      .prediction = case_when(
+        assignment == "observed"       ~ as.numeric(niaid_outcome),
+        assignment == "counterfactual" ~ as.numeric(.prediction)) %>%
+          factor(levels = 1:7, labels = niaid_levels, ordered = TRUE)) %>%
+    group_by({{ grouping_factor }}, .draw) %>%
+    summarize(
+      logor_hat =
+        possibly(
+          polr_est_only, 
+          otherwise = NA, 
+          quiet = FALSE)(
+        treat, .prediction)) %>%
+    ungroup()
+  }
+```
+
+Summary functions:
+
+```{r}
+summarize_grouped_matched_posterior <-
+  function(grouped_posterior, grouping_factor) {
+    grouped_posterior %>%
+      ungroup() %>% 
+      group_by({{ grouping_factor }}) %>%
+    summarise(
+      logor_95_lower    = quantile(logor_hat, .025, na.rm = TRUE),
+      logor_95_upper    = quantile(logor_hat, .975, na.rm = TRUE),
+      logor_se          = sd(logor_hat, na.rm = TRUE),
+      prop_na_logor_hat = mean(is.na(logor_hat)),
+      logor_hat         = median(logor_hat, na.rm = TRUE) # this needs need to be last!
+    )
+  }
+
+```
+
+### Superpopulation estimand
+
+```{r}
+grouped_superpop_posterior <-
+  function(paired_fitted_draws, grouping_factor) {
+    paired_fitted_draws %>%
+    mutate(.category = as.numeric(substr(.category, 1, 2))) %>%
+    group_by(.draw, treat, .category, {{grouping_factor}}) %>%
+    # Compute expected proportions within each treatment x group x category stratum
+    summarise(ave_prob = mean(value)) %>%
+    # Compute (logit) eCDFs within treatment x group stratum
+    group_by(.draw, treat, {{grouping_factor}}) %>%
+    arrange(.category) %>%
+    mutate(cuml_prob = cumsum(ave_prob),
+           cuml_logit = qlogis(cuml_prob)) %>%
+    # Compute estimands of interest within each group stratum
+    group_by(.draw, {{grouping_factor}}) %>%
+    arrange(treat, .category) %>%
+    summarise(
+      mean_logor = -mean(cuml_logit[treat == "HCQ"][1:6] - cuml_logit[treat == "no_HCQ"][1:6]),
+      logor_hat  = 
+        possibly(
+          polr_est_only, otherwise = NA, quiet = FALSE)(
+          treat, factor(
+            .category, ordered = TRUE),
+            # ensure at least 1000 in each category
+            weights = round(1000 * ave_prob/min(c(ave_prob, 1 - ave_prob)))),
+      
+      # Survival
+      est_p_surv_HCQ    = 1 - ave_prob[(.category == 1) & (treat == "HCQ")],
+      est_p_surv_no_HCQ = 1 - ave_prob[(.category == 1) & (treat == "no_HCQ")],
+      or_surv = (est_p_surv_HCQ/(1 - est_p_surv_HCQ))/(est_p_surv_no_HCQ/(1 - est_p_surv_no_HCQ)),
+      logor_surv = log(or_surv),
+      rd_surv = est_p_surv_HCQ - est_p_surv_no_HCQ,
+      
+      # Not (mechanical ventilation or death)
+      est_p_n12_HCQ    = 1 - ave_prob[(.category <= 2) & (treat == "HCQ")],
+      est_p_n12_no_HCQ = 1 - ave_prob[(.category <= 2) & (treat == "no_HCQ")],
+      or_n12 = (est_p_n12_HCQ/(1 - est_p_n12_HCQ))/(est_p_n12_no_HCQ/(1 - est_p_n12_no_HCQ)),
+      logor_n12 = log(or_n12),
+      rd_n12 = est_p_n12_HCQ - est_p_n12_no_HCQ
+      )
+  }
+```
+
+Summary function:
+
+```{r}
+summarize_grouped_superpop_posterior <-
+  function(grouped_posterior, grouping_factor) {
+    grouped_posterior %>%
+      ungroup() %>% 
+      group_by({{ grouping_factor }}) %>%
+    summarise(
+      logor_95_lower    = quantile(logor_hat, .025, na.rm = TRUE),
+      logor_95_upper    = quantile(logor_hat, .975, na.rm = TRUE),
+      logor_se          = sd(logor_hat, na.rm = TRUE),
+      prop_na_logor_hat = mean(is.na(logor_hat)),
+      # These must go last
+      logor_hat         = median(logor_hat, na.rm = TRUE),
+      
+      or_surv_95_lower  = quantile(or_surv, .025, na.rm = TRUE),
+      or_surv_95_upper  = quantile(or_surv, .975, na.rm = TRUE),
+      prop_na_or_surv   = mean(is.na(or_surv)),
+      or_surv           = median(or_surv, na.rm = TRUE),
+      
+      or_n12_95_lower   = quantile(or_n12, .025, na.rm = TRUE),
+      or_n12_95_upper   = quantile(or_n12, .975, na.rm = TRUE),
+      prop_na_or_n12    = mean(is.na(or_n12)),
+      or_n12            = median(or_n12, na.rm = TRUE),
+      
+      rd_surv_95_lower  = quantile(rd_surv, .025),
+      rd_surv_95_upper  = quantile(rd_surv, .975),
+      rd_surv           = median(rd_surv),
+      
+      rd_n12_95_lower   = quantile(rd_n12, .025),
+      rd_n12_95_upper   = quantile(rd_n12, .975),
+      rd_n12            = median(rd_n12),
+      
+      est_p_surv_HCQ_95_lower   = quantile(est_p_surv_HCQ, .025),
+      est_p_surv_HCQ_95_upper   = quantile(est_p_surv_HCQ, .975),
+      est_p_surv_HCQ            = median(est_p_surv_HCQ),
+      
+      est_p_surv_no_HCQ_95_lower   = quantile(est_p_surv_no_HCQ, .025),
+      est_p_surv_no_HCQ_95_upper   = quantile(est_p_surv_no_HCQ, .975),
+      est_p_surv_no_HCQ            = median(est_p_surv_no_HCQ),
+      
+      est_p_n12_HCQ_95_lower   = quantile(est_p_n12_HCQ, .025),
+      est_p_n12_HCQ_95_upper   = quantile(est_p_n12_HCQ, .975),
+      est_p_n12_HCQ            = median(est_p_n12_HCQ),
+      
+      est_p_n12_no_HCQ_95_lower   = quantile(est_p_n12_no_HCQ, .025),
+      est_p_n12_no_HCQ_95_upper   = quantile(est_p_n12_no_HCQ, .975),
+      est_p_n12_no_HCQ            = median(est_p_n12_no_HCQ)
+    )
+  }
+```
+
+### Simple plugin estimator
+
+```{r}
+or_fit_surv <- function(treat, outcome) {
+  logit_tidy_fit(treat,  as.numeric(outcome) != 1) %>%
+        transmute(
+          or_surv          = exp(logor_hat), 
+          or_surv_95_lower = exp(logor_95_lower), 
+          or_surv_95_upper = exp(logor_95_upper))
+}
+
+or_fit_n12 <- function(treat, outcome) {
+  logit_tidy_fit(treat, as.numeric(outcome) > 2) %>%
+        transmute(
+          or_n12 = exp(logor_hat), 
+          or_n12_95_lower = exp(logor_95_lower), 
+          or_n12_95_upper = exp(logor_95_upper))
+}
+
+rd_fit_surv <- function(treat, outcome) {
+  fit <- rd_plugin(treat == "HCQ", as.numeric(outcome) != 1)
+  
+  tibble(rd_surv = fit["est.diff"],
+         rd_surv_95_lower = fit["lower_95"],
+         rd_surv_95_upper = fit["upper_95"])
+}
+
+rd_fit_n12 <- function(treat, outcome) {
+  fit <- rd_plugin(treat == "HCQ", as.numeric(outcome) > 2)
+  
+  tibble(rd_n12 = fit["est.diff"],
+         rd_n12_95_lower = fit["lower_95"],
+         rd_n12_95_upper = fit["upper_95"])
+}
+
+fit_p_tidy <- function(treat_grp, outcome) {
+  fit <- prop_plugin(treat_grp, outcome)
+  
+  tibble(p_hat = fit["est.prop"],
+         lower_95 = fit["lower_95"],
+         upper_95 = fit["upper_95"])
+}
+      
+
+polr_grouped_plugin <-
+  function(data_table, grouping_factor) {
+    data_table %>%
+    group_by({{ grouping_factor }}) %>%
+    summarise(
+      polr_est = 
+        # Plug-in polr estimator doesn't make much sense for small n
+        # or when there aren't both treatment groups represented
+        list(possibly(polr_tidy_fit, otherwise = tibble(), quiet = FALSE)
+          (treat, niaid_outcome)),
+      or_surv_analysis =
+        list(possibly(or_fit_surv, otherwise = tibble(), quiet = FALSE)
+          (treat, niaid_outcome)),
+      or_n12_analysis =
+        list(possibly(or_fit_n12, otherwise = tibble(), quiet = FALSE)
+          (treat, niaid_outcome)),
+      rd_surv = list(possibly(rd_fit_surv, otherwise = tibble(), quiet = FALSE)
+                     (treat, niaid_outcome)),
+      rd_n12  = list(possibly(rd_fit_n12, otherwise = tibble(), quiet = FALSE)
+                     (treat, niaid_outcome)),
+      est_p_surv_HCQ    = list(possibly(fit_p_tidy, otherwise = tibble(p_hat = NA, lower_95 = NA, upper_95 = NA), quiet = FALSE)
+                     (treat == "HCQ", as.numeric(niaid_outcome) != 1) %>%
+        rename(est_p_surv_HCQ = p_hat,
+               est_p_surv_HCQ_95_lower = lower_95,
+               est_p_surv_HCQ_95_upper = upper_95)),
+      est_p_surv_no_HCQ = list(possibly(fit_p_tidy, otherwise = tibble(p_hat = NA, lower_95 = NA, upper_95 = NA), quiet = FALSE)
+                     (treat == "no_HCQ", as.numeric(niaid_outcome) != 1) %>%
+        rename(est_p_surv_no_HCQ = p_hat,
+               est_p_surv_no_HCQ_95_lower = lower_95,
+               est_p_surv_no_HCQ_95_upper = upper_95)),
+      est_p_n12_HCQ     = list(possibly(fit_p_tidy, otherwise = tibble(p_hat = NA, lower_95 = NA, upper_95 = NA), quiet = FALSE)
+                     (treat == "HCQ", as.numeric(niaid_outcome) > 2) %>%
+        rename(est_p_n12_HCQ = p_hat,
+               est_p_n12_HCQ_95_lower = lower_95,
+               est_p_n12_HCQ_95_upper = upper_95)),
+      est_p_n12_no_HCQ  = list(possibly(fit_p_tidy, otherwise = tibble(p_hat = NA, lower_95 = NA, upper_95 = NA), quiet = FALSE)
+                     (treat == "no_HCQ", as.numeric(niaid_outcome) > 2) %>%
+        rename(est_p_n12_no_HCQ = p_hat,
+               est_p_n12_no_HCQ_95_lower = lower_95,
+               est_p_n12_no_HCQ_95_upper = upper_95))
+      ) %>%
+    unnest(c(
+      polr_est, or_surv_analysis, or_n12_analysis,
+      rd_surv, rd_n12, 
+      est_p_surv_HCQ, est_p_surv_no_HCQ, est_p_n12_HCQ, est_p_n12_no_HCQ), 
+      keep_empty = TRUE)
+  }
+```
+
+
+
+
+```{r}
+standardized_effect_analysis <- 
+  function(paired_posterior_draws, fitted_posterior_draws, raw_data, grouping_factor) {
+    
+    # Standardize over actual (i.e., possibly missing) rather than imputed
+    # covariate values
+    fitted_posterior_draws <-
+      left_join(fitted_posterior_draws %>% select(-{{grouping_factor}}), 
+                raw_data %>% select(patient_id, {{grouping_factor}}))
+    
+    paired_posterior_draws <-
+      left_join(paired_posterior_draws %>% select(-{{grouping_factor}}),
+                raw_data %>% select(patient_id, {{grouping_factor}}))
+    
+    superpop_posterior <- grouped_superpop_posterior(fitted_posterior_draws, {{grouping_factor}})
+      
+    matched_posterior <- grouped_matched_posterior(paired_posterior_draws, {{grouping_factor}})
+    
+    plug_in_summary <- polr_grouped_plugin(raw_data, {{grouping_factor}})
+    
+    # summary table
+    summary_table <- bind_rows(
+      summarize_grouped_superpop_posterior(superpop_posterior, {{grouping_factor}}) %>% 
+        mutate(analysis = "superpop_posterior"),
+      summarize_grouped_matched_posterior(matched_posterior, {{grouping_factor}}) %>%
+        mutate(analysis = "matched_posterior"),
+      plug_in_summary %>% 
+        mutate(analysis = "maximum likelihood")
+    )
+        
+    return(list(
+      # superpop_posterior = superpop_posterior, # -- full posterior -- in case we want more detailed plots
+      # matched_posterior = matched_posterior,   # -- full posterior -- in case we want more detailed plots
+      summary_table = summary_table,
+      # plot = effect_summary_plot(summary_table, {{ grouping_factor }}), # this creates a huge object for some reason
+      factor_count = raw_data %>% count({{ grouping_factor }}),
+      factor_count_treat = raw_data %>% count({{ grouping_factor }}, treat)))
+  }
+```
+
+### Plotting functions
+
+Plotting functions:
+
+```{r}
+# basic summary plot
+effect_summary_plot <- function(summary_table, grouping_factor) {
+      summary_table %>%
+      ggplot(aes({{ grouping_factor }}, logor_hat), data = .) +
+      theme(panel.background = element_rect(fill = "grey95")) +
+      background_grid(major = "y", color.major = "white", size.major = .6) +
+      geom_pointrange(
+        aes(ymin = logor_95_lower, ymax = logor_95_upper, color = analysis),
+        position = position_dodge(width = .5))
+}
+```
+
+Adding size based on n in group:
+
+```{r}
+effect_summary_plot_sized_dots <- function(
+  summary_table, count_table, 
+  grouping_factor,
+  max_point_size = 5) {
+      plot_data <- 
+        summary_table %>%
+        left_join(count_table) %>%
+        mutate(scale_point = ifelse(analysis == "maximum likelihood", TRUE, FALSE))
+      
+      plot_data %>%
+        ggplot(aes({{ grouping_factor }}, logor_hat), data = .) +
+        theme(panel.background = element_rect(fill = "grey95")) +
+        background_grid(major = "y", color.major = "white", size.major = .6) +
+        geom_linerange(aes(ymin = logor_95_lower, ymax = logor_95_upper, color = analysis),
+                       position = position_dodge(width = .7)) +
+        geom_point(
+          aes(color = analysis, alpha = scale_point,
+              size = n),
+          position = position_dodge(width = .7),
+              shape = 21,
+              fill = "grey95",
+          data = plot_data) +
+        geom_point(
+          aes(color = analysis, alpha = I(!scale_point)),
+          position = position_dodge(width = .7),
+          size = 2,
+          data = plot_data) +
+        scale_size_area(max_size = max_point_size) +
+        scale_alpha_manual(values = c(0, 1)) +
+        guides(alpha = FALSE)
+}
+#effect_summary_plot_sized_dots(age_analysis$summary_table, data_tbl %>% mutate(age_fct = mk_age_fct(age_5y)), age_fct)
+```
+
+## Perform subgroup analyses by factor
+
+### Age
+
+```{r}
+age_subgroups <-
+  c("≤29", "30-49", "50-69", "70-79", "80+")
+
+mk_age_fct <- function(age) {
+  case_when(
+    age <  30            ~ "≤29",
+    age >= 30 & age < 50 ~ "30-49",
+    age >= 50 & age < 70 ~ "50-69",
+    age >= 70 & age < 79 ~ "70-79",
+    age >= 80            ~ "80+"
+    ) %>%
+    factor(age_subgroups,
+           ordered = TRUE)
+}
+```
+
+```{r}
+system.time(age_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp %>%
+    mutate(age_fct = mk_age_fct(age_5y)),
+  fitted_posterior_draws = data_tbl_po_fitted %>%
+    mutate(age_fct = mk_age_fct(age_5y)),
+  raw_data = data_tbl %>%
+    mutate(age_fct = mk_age_fct(age_5y)), 
+  age_fct))
+```
+
+```{r}
+write_rds(age_analysis, file.path(subgroup_dir, paste0(params$fit_name, "_age_analysis.rds")))
+```
+
+### Study
+
+```{r}
+site_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp,
+  fitted_posterior_draws = data_tbl_po_fitted,
+  raw_data = data_tbl, 
+  siteid)
+```
+
+```{r}
+write_rds(site_analysis, file.path(subgroup_dir, paste0(params$fit_name, "_site_analysis.rds")))
+```
+
+### BMI
+
+```{r}
+bmi_subgroups <-
+  c("≤20", "20-25", "25-30", "30-35", ">35")
+
+mk_bmi_fct <- function(bmi) {
+  case_when(
+    bmi <= 20             ~ "≤20",
+    bmi >  20 & bmi <= 25 ~ "20-25",
+    bmi >  25 & bmi <= 30 ~ "25-30",
+    bmi >  30 & bmi <= 35 ~ "30-35",
+    bmi >  35             ~ ">35"
+    ) %>%
+    factor(levels = bmi_subgroups,
+           ordered = TRUE)
+}
+```
+
+```{r}
+bmi_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp %>%
+    mutate(bmi_fct = mk_bmi_fct(bmi)),
+  fitted_posterior_draws = data_tbl_po_fitted %>%
+    mutate(bmi_fct = mk_bmi_fct(bmi)),
+  raw_data = data_tbl %>%
+    mutate(bmi_fct = mk_bmi_fct(bmi)), 
+  bmi_fct)
+```
+
+```{r}
+write_rds(bmi_analysis, file.path(subgroup_dir, paste0(params$fit_name, "bmi_analysis.rds")))
+```
+
+### Sex
+
+```{r}
+sex_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp,
+  fitted_posterior_draws = data_tbl_po_fitted,
+  raw_data = data_tbl,
+  sex_fct)
+```
+
+```{r}
+write_rds(sex_analysis, file.path(subgroup_dir, paste0(params$fit_name, "sex_analysis.rds")))
+```
+
+```{r}
+effect_summary_plot(sex_analysis$summary_table, sex_fct)
+```
+
+### Baseline NCOSS
+
+```{r}
+baseline_niaid_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp,
+  fitted_posterior_draws = data_tbl_po_fitted,
+  raw_data = data_tbl,
+  niaid_baseline_fct)
+```
+
+```{r}
+write_rds(baseline_niaid_analysis, file.path(subgroup_dir, paste0(params$fit_name, "baseline_niaid_analysis.rds")))
+```
+
+```{r}
+effect_summary_plot(baseline_niaid_analysis$summary_table, niaid_baseline_fct)
+```
+
+### Baseline risk
+
+```{r}
+data_tbl_annotated <-
+  data_tbl_annotated %>% 
+  mutate(
+    risk_score_quintile_fct = 
+      factor(cut_number(
+        -lin_pred_control # Higher values correspond to *better* predicted outcome
+        , n = 5, labels = FALSE)))
+
+patient_risk_tbl <- data_tbl_annotated %>% select(patient_id, risk_score_quintile_fct)
+```
+
+```{r}
+risk_score_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp %>%
+   left_join(patient_risk_tbl),
+  fitted_posterior_draws = data_tbl_po_fitted %>%
+   left_join(patient_risk_tbl),
+  raw_data = data_tbl_annotated,
+  risk_score_quintile_fct
+)
+```
+
+```{r}
+effect_summary_plot(risk_score_analysis$summary_table, risk_score_quintile_fct)
+```
+
+```{r}
+write_rds(risk_score_analysis, file.path(subgroup_dir, paste0(params$fit_name, "risk_score_analysis.rds")))
+```
+
+### Number of baseline comorbidities
+
+```{r}
+comorbidity_subgroups <-
+  c("0", "1", "2", "3", "≥4")
+
+mk_comorbidity_fct <- function(comorbidity_count) {
+  case_when(
+    comorbidity_count == 0 ~ "0",
+    comorbidity_count == 1 ~ "1",
+    comorbidity_count == 2 ~ "2",
+    comorbidity_count == 3 ~ "3",
+    comorbidity_count >= 4 ~ "≥4",
+    ) %>%
+    factor(levels = comorbidity_subgroups,
+           ordered = TRUE)
+}
+```
+
+```{r}
+comorbidity_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp %>%
+    mutate(comorbidity_fct = mk_comorbidity_fct(comorbidity_count)),
+  fitted_posterior_draws = data_tbl_po_fitted %>%
+    mutate(comorbidity_fct = mk_comorbidity_fct(comorbidity_count)),
+  raw_data = data_tbl %>%
+    mutate(comorbidity_fct = mk_comorbidity_fct(comorbidity_count)),
+  comorbidity_fct)
+```
+
+```{r}
+write_rds(comorbidity_analysis, file.path(subgroup_dir, paste0(params$fit_name, "comorbidities_analysis.rds")))
+```
+
+### Overall
+
+```{r}
+overall_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp %>%
+    mutate(overall_fct = "overall"),
+  fitted_posterior_draws = data_tbl_po_fitted %>%
+    mutate(overall_fct = "overall"),
+  raw_data = data_tbl %>%
+    mutate(overall_fct = "overall"),
+  overall_fct)
+```
+
+```{r}
+effect_summary_plot(overall_analysis$summary_table, overall_fct)
+```
+
+```{r}
+write_rds(overall_analysis, file.path(subgroup_dir, paste0(params$fit_name, "overall_analysis.rds")))
+```
+
+### (Post-hoc) Symptom onset days before enrollment
+
+```{r}
+data_tbl_annotated <-
+  data_tbl_annotated %>% 
+  mutate(
+    sym_onset_fct = 
+      factor(cut_number(
+        sym_onst_days_bfr_enrdt, 
+        n = 3),
+        ordered = TRUE))
+
+patient_sym_onset_tbl <- data_tbl_annotated %>% select(patient_id, sym_onset_fct)
+```
+
+```{r}
+sym_onset_analysis <- standardized_effect_analysis(
+  paired_posterior_draws = data_tbl_po_pp %>%
+   left_join(patient_sym_onset_tbl),
+  fitted_posterior_draws = data_tbl_po_fitted %>%
+   left_join(patient_sym_onset_tbl),
+  raw_data = data_tbl_annotated,
+  sym_onset_fct
+)
+```
+
+```{r}
+effect_summary_plot(sym_onset_analysis$summary_table, sym_onset_fct)
+```
+
+```{r}
+write_rds(sym_onset_analysis, file.path(subgroup_dir, paste0(params$fit_name, "sym_onset_analysis.rds")))
+```
+
+
+## Summarizing all this
+
+Write out subgroup analysis table:
+
+```{r fig.height = 10, fig.width = 8}
+all_effect_summaries <-
+  bind_rows(
+    overall_analysis$summary_table        %>% mutate(subgroups = "overall", level = overall_fct),
+    site_analysis$summary_table           %>% mutate(subgroups = "site",    level = siteid),
+    sex_analysis$summary_table            %>% mutate(subgroups = "sex",     level = sex_fct),
+    age_analysis$summary_table            %>% mutate(subgroups = "age",     level = age_fct),
+    bmi_analysis$summary_table            %>% mutate(subgroups = "bmi",     level = bmi_fct),
+    comorbidity_analysis$summary_table    %>% mutate(subgroups = "# comorbidities", level = comorbidity_fct),
+    baseline_niaid_analysis$summary_table %>% mutate(subgroups = "baseline_niaid", level = niaid_baseline_fct),
+    risk_score_analysis$summary_table     %>% mutate(subgroups = "baseline_risk_quintile", level = scales::label_ordinal()(as.numeric(risk_score_quintile_fct))),
+    sym_onset_analysis$summary_table      %>% mutate(subgroups = "sym_onset_fct", level = sym_onset_fct)
+  ) %>%
+  select(-c(overall_fct, siteid, sex_fct, age_fct, bmi_fct, comorbidity_fct, niaid_baseline_fct, risk_score_quintile_fct, -sym_onset_fct))
+
+# level_order <- unique(all_effect_summaries$level)[
+#   str_extract(unique(all_effect_summaries$level))
+# ]
+```
+
+```{r}
+# Need to mutate(siteid = level, subgroups = "site") & analogously
+all_group_sizes <-
+  bind_rows(
+    data_tbl %>% 
+      mutate(overall_fct = "overall") %>% 
+      count(overall_fct) %>%
+      mutate(subgroups = "overall", level = overall_fct) %>%
+      select(-overall_fct),
+    data_tbl %>% count(siteid) %>% mutate(subgroups = "site",    level = siteid) %>% select(-siteid),
+    data_tbl %>% count(sex_fct) %>% mutate(subgroups = "sex",     level = sex_fct) %>% select(-sex_fct),
+    data_tbl %>% mutate(age_fct = mk_age_fct(age_5y)) %>% count(age_fct) %>% mutate(subgroups = "age",     level = age_fct) %>% select(-age_fct),
+    data_tbl %>% mutate(bmi_fct = mk_bmi_fct(bmi)) %>% count(bmi_fct)%>% mutate(subgroups = "bmi",     level = bmi_fct) %>% select(-bmi_fct),
+    data_tbl %>% count(niaid_baseline_fct) %>% mutate(subgroups = "baseline_niaid", level = niaid_baseline_fct) %>% select(-niaid_baseline_fct),
+    data_tbl %>% mutate(comorbidity_fct = mk_comorbidity_fct(comorbidity_count)) %>% count(comorbidity_fct) %>% mutate(subgroups = "# comorbidities", level = comorbidity_fct) %>% select(-comorbidity_fct),
+    data_tbl_annotated %>% count(risk_score_quintile_fct) %>% mutate(subgroups = "baseline_risk_quintile", level = scales::label_ordinal()(as.numeric(risk_score_quintile_fct))) %>% select(-risk_score_quintile_fct),
+    data_tbl_annotated %>% count(sym_onset_fct) %>% mutate(subgroups = "sym_onset_fct", level = sym_onset_fct)
+  )
+
+write_tsv(all_effect_summaries %>% left_join(all_group_sizes),
+          file.path(subgroup_dir, "subgroup_analysis_table.tsv"))
+```
+
+## Plots (Figure 1)
+
+An order for the different kinds of subgroups, and their levels:
+
+```{r}
+grouping_order <-
+  c("overall",
+    "site",
+    "baseline_niaid",
+    "age",
+    "sex",
+    "# comorbidities",
+    "bmi",
+    "sym_onset_fct",
+    "baseline_risk_quintile"
+    )
+
+level_order <-
+  c(bmi_subgroups,
+    age_subgroups,
+    comorbidity_subgroups,
+    levels(data_tbl$niaid_baseline_fct),
+    as.character(arrange(count(data_tbl, siteid), desc(n))$siteid), # sites in descending n order
+    c("female", "male"),
+    "overall",
+    scales::label_ordinal()(1:5),
+    levels(patient_sym_onset_tbl$sym_onset_fct),
+    NA, "(Missing)"
+    )
+
+all_group_sizes <- all_group_sizes %>%
+  mutate(subgroups = factor(subgroups, levels = grouping_order, ordered = TRUE),
+         level = factor(level, levels = rev(level_order), ordered = TRUE))
+```
+
+Produce an overall summary plot:
+
+```{r fig.width=9, fig.height=12}
+all_effect_summaries %>%
+  mutate(subgroups = factor(subgroups, levels = grouping_order, ordered = TRUE),
+         level = factor(level, levels = rev(level_order), ordered = TRUE)) %>%
+  effect_summary_plot_sized_dots(
+  all_group_sizes, level) +
+  coord_flip(ylim = c(-4, 2)) +
+  facet_grid(subgroups~., space = "free_y", scales = "free_y") +
+  # theme(strip.placement = "outside", strip.text = element_text(angle = 0)) +
+  background_grid(major = "x", color.major = "white")
+```
+
+The same, but without the finite sample/matched posterior estimates, and filtering out NAs:
+
+```{r fig.width=9, fig.height=10}
+odds_breaks <- c(.01, .1, .2, .5, 1, 2, 5, 10)
+
+fig2_data <- all_effect_summaries  %>%
+   mutate(subgroups = factor(subgroups, levels = grouping_order, ordered = TRUE),
+          level = factor(level, levels = rev(level_order), ordered = TRUE))
+
+(figure_2_subgroups <- 
+   fig2_data %>% 
+   filter(analysis != "matched_posterior", level != "NA") %>%
+   effect_summary_plot_sized_dots(
+     all_group_sizes, 
+     level) +
+   coord_flip(ylim = log(c(.1, 10)) # HARD CODING THIS
+              ) +
+   facet_grid(subgroups~., space = "free_y", scales = "free_y") +
+   background_grid(major = "x", color.major = "white") +
+   scale_color_manual(
+     values =
+       c("maximum likelihood" = "grey30",
+         "superpop_posterior" = "cornflowerblue")
+  ) + scale_y_continuous(
+    labels = str_c(odds_breaks, "×"), 
+    breaks = log(odds_breaks)) + 
+    ylab("proportional odds ratio")
+    )
+
+ggsave(filename = file.path(subgroup_dir, paste0("figure_2.png")), width = 9, height = 10)
+ggsave(filename = file.path(subgroup_dir, paste0("figure_2.svg")), width = 9, height = 10)
+```
+
+Corresponding table:
+
+```{r}
+formatted_effect_table <-
+  all_effect_summaries %>% 
+  mutate(
+    estimate_polr = ci_fmt(
+      exp(logor_hat),
+      exp(logor_95_lower),
+      exp(logor_95_upper),
+      trim = TRUE),
+    estimate_rd_surv = ci_fmt(
+      rd_surv,
+      rd_surv_95_lower,
+      rd_surv_95_upper,
+      trim = TRUE)) %>% 
+  select(analysis, subgroups, level, estimate_polr, estimate_rd_surv) %>% 
+  filter(
+    analysis %in% c("maximum likelihood", "superpop_posterior")) %>% 
+  pivot_wider(names_from = analysis, values_from = c(estimate_polr, estimate_rd_surv)) %>% 
+  mutate(subgroups = factor(subgroups, 
+                            levels = grouping_order,
+                            ordered = TRUE),
+         level = factor(level, 
+                        levels = rev(level_order), 
+                        ordered = TRUE)) %>% 
+  arrange(subgroups, rev(level))
+
+write_tsv(formatted_effect_table, file.path(subgroup_dir, paste0("formatted_effect_table.tsv")))
+
+formatted_effect_table %>% knitr::kable()
+```
+
+Absolute risk and risk differences by subgroup:
+
+```{r fig.width=9, fig.height=10}
+rd_breaks <- seq(-1, 1, .2)
+
+(fig_rd <- all_effect_summaries  %>%
+   mutate(subgroups = factor(subgroups, levels = grouping_order, ordered = TRUE),
+          level = factor(level, levels = rev(level_order), ordered = TRUE)) %>% 
+  # HACK! #############
+  mutate(logor_hat = rd_surv, logor_95_lower = rd_surv_95_lower, logor_95_upper = rd_surv_95_upper) %>%
+   filter(analysis != "matched_posterior", level != "NA") %>%
+   effect_summary_plot_sized_dots(
+     all_group_sizes, 
+     level) +
+   coord_flip(ylim = c(-.3, .3) # HARD CODING THIS
+              ) +
+   facet_grid(subgroups~., space = "free_y", scales = "free_y") +
+   background_grid(major = "x", color.major = "white") +
+   scale_color_manual(
+     values =
+       c("maximum likelihood" = "grey30",
+         "superpop_posterior" = "cornflowerblue")
+  ) + scale_y_continuous(
+    breaks = rd_breaks,
+    labels = scales::percent) + 
+    ylab("risk difference for survival") +
+    ggtitle("Estimated risk differences of survival (HC/CQ versus control): pooled and subgroup analyses"))
+
+ggsave(filename = file.path(subgroup_dir, paste0("figure_rd.png")), width = 9, height = 10)
+ggsave(filename = file.path(subgroup_dir, paste0("figure_rd.svg")), width = 9, height = 10)
+```
+
+
+```{r fig.width=9, fig.height=10}
+risk_breaks <- seq(0, 1, .2)
+
+(fig_p_surv_HCQ <- all_effect_summaries  %>%
+   mutate(subgroups = factor(subgroups, levels = grouping_order, ordered = TRUE),
+          level = factor(level, levels = rev(level_order), ordered = TRUE)) %>% 
+  # HACK! #############
+  mutate(logor_hat = est_p_surv_HCQ, 
+         logor_95_lower = est_p_surv_HCQ_95_lower, 
+         logor_95_upper = est_p_surv_HCQ_95_upper) %>%
+   filter(analysis != "matched_posterior", level != "NA") %>%
+   effect_summary_plot_sized_dots(
+     all_group_sizes, 
+     level) +
+   coord_flip(ylim = c(0, 1)) +
+   facet_grid(subgroups~., space = "free_y", scales = "free_y") +
+   background_grid(major = "x", color.major = "white") +
+   scale_color_manual(
+     values =
+       c("maximum likelihood" = "grey30",
+         "superpop_posterior" = "cornflowerblue")
+  ) + scale_y_continuous( 
+    breaks = risk_breaks,
+    labels = scales::percent_format(accuracy = 1)) + 
+    ylab("survival rate under HC/CQ") +
+    ggtitle("Estimated survival rate under HC/CQ: pooled and subgroup analyses"))
+
+ggsave(filename = file.path(subgroup_dir, paste0("figure_p_surv_HCQ.png")), width = 9, height = 10)
+ggsave(filename = file.path(subgroup_dir, paste0("figure_p_surv_HCQ.svg")), width = 9, height = 10)
+```
+
+```{r fig.width=9, fig.height=10}
+risk_breaks <- seq(0, 1, .2)
+
+(fig_p_surv_no_HCQ <- all_effect_summaries  %>%
+   mutate(subgroups = factor(subgroups, levels = grouping_order, ordered = TRUE),
+          level = factor(level, levels = rev(level_order), ordered = TRUE)) %>% 
+  # HACK! #############
+  mutate(logor_hat = est_p_surv_no_HCQ, 
+         logor_95_lower = est_p_surv_no_HCQ_95_lower, 
+         logor_95_upper = est_p_surv_no_HCQ_95_upper) %>%
+   filter(analysis != "matched_posterior", level != "NA") %>%
+   effect_summary_plot_sized_dots(
+     all_group_sizes, 
+     level) +
+   coord_flip(ylim = c(0, 1)) +
+   facet_grid(subgroups~., space = "free_y", scales = "free_y") +
+   background_grid(major = "x", color.major = "white") +
+   scale_color_manual(
+     values =
+       c("maximum likelihood" = "grey30",
+         "superpop_posterior" = "cornflowerblue")
+  ) + scale_y_continuous( 
+    breaks = risk_breaks,
+    labels = scales::percent_format(accuracy = 1)) + 
+    ylab("survival rate under control") +
+    ggtitle("Estimated survival rate under control: pooled and subgroup analyses"))
+
+ggsave(filename = file.path(subgroup_dir, paste0("figure_p_surv_no_HCQ.png")), width = 9, height = 10)
+ggsave(filename = file.path(subgroup_dir, paste0("figure_p_surv_no_HCQ.svg")), width = 9, height = 10)
+```
+
+### Add mortality (1 - survival)
+
+```{r fig.width=9, fig.height=10}
+risk_breaks <- seq(0, 1, .2)
+
+(fig_p_mortality_HCQ <- all_effect_summaries  %>%
+   mutate(subgroups = factor(subgroups, levels = grouping_order, ordered = TRUE),
+          level = factor(level, levels = rev(level_order), ordered = TRUE)) %>% 
+  # HACK! #############
+  mutate(logor_hat = 1 - est_p_surv_HCQ, 
+         logor_95_lower = 1 - est_p_surv_HCQ_95_upper, # NOTA BENE
+         logor_95_upper = 1 - est_p_surv_HCQ_95_lower) %>%
+   filter(analysis != "matched_posterior", level != "NA") %>%
+   effect_summary_plot_sized_dots(
+     all_group_sizes, 
+     level) +
+   coord_flip(ylim = c(0, 1)) +
+   facet_grid(subgroups~., space = "free_y", scales = "free_y") +
+   background_grid(major = "x", color.major = "white") +
+   scale_color_manual(
+     values =
+       c("maximum likelihood" = "grey30",
+         "superpop_posterior" = "cornflowerblue")
+  ) + scale_y_continuous( 
+    breaks = risk_breaks,
+    labels = scales::percent_format(accuracy = 1)) + 
+    ylab("mortality rate under HC/CQ") +
+    ggtitle("Estimated mortality rate under HC/CQ: pooled and subgroup analyses"))
+
+ggsave(filename = file.path(subgroup_dir, paste0("figure_p_mortality_HCQ.png")), width = 9, height = 10)
+ggsave(filename = file.path(subgroup_dir, paste0("figure_p_mortality_HCQ.svg")), width = 9, height = 10)
+```
+
+```{r fig.width=9, fig.height=10}
+risk_breaks <- seq(0, 1, .2)
+
+(fig_p_mortality_no_HCQ <- all_effect_summaries  %>%
+   mutate(subgroups = factor(subgroups, levels = grouping_order, ordered = TRUE),
+          level = factor(level, levels = rev(level_order), ordered = TRUE)) %>% 
+  # HACK! #############
+  mutate(logor_hat = 1 - est_p_surv_no_HCQ, 
+         logor_95_lower = 1 - est_p_surv_no_HCQ_95_upper, # NOTA BENE
+         logor_95_upper = 1 - est_p_surv_no_HCQ_95_lower) %>%
+   filter(analysis != "matched_posterior", level != "NA") %>%
+   effect_summary_plot_sized_dots(
+     all_group_sizes, 
+     level) +
+   coord_flip(ylim = c(0, 1)) +
+   facet_grid(subgroups~., space = "free_y", scales = "free_y") +
+   background_grid(major = "x", color.major = "white") +
+   scale_color_manual(
+     values =
+       c("maximum likelihood" = "grey30",
+         "superpop_posterior" = "cornflowerblue")
+  ) + scale_y_continuous( 
+    breaks = risk_breaks,
+    labels = scales::percent_format(accuracy = 1)) + 
+    ylab("mortality rate under control") +
+    ggtitle("Estimated mortality rate under control: pooled and subgroup analyses"))
+
+ggsave(filename = file.path(subgroup_dir, paste0("figure_p_mortality_no_HCQ.png")), width = 9, height = 10)
+ggsave(filename = file.path(subgroup_dir, paste0("figure_p_mortality_no_HCQ.svg")), width = 9, height = 10)
+```
+
+### Combined Figure 2
+
+```{r}
+require(patchwork)
+```
+
+```{r fig.height=10, fig.width=18}
+figure_2_subgroups + fig_rd
+
+ggsave(filename = file.path(subgroup_dir, paste0("figure_2_combined.png")), width = 18, height = 10)
+ggsave(filename = file.path(subgroup_dir, paste0("figure_2_combined.svg")), width = 18, height = 10)
+```
+
+
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+```{r}
+Sys.time()
+```
+
